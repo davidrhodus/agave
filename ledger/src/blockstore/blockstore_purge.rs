@@ -522,11 +522,13 @@ pub mod tests {
     use {
         super::*,
         crate::{
-            blockstore::tests::make_slot_entries_with_transactions, get_tmp_ledger_path_auto_delete,
+            blockstore::tests::{create_test_v1_transaction, make_slot_entries_with_transactions},
+            get_tmp_ledger_path_auto_delete,
         },
         bincode::serialize,
-        solana_entry::entry::next_entry_mut,
+        solana_entry::entry::{next_entry_mut, next_versioned_entry},
         solana_hash::Hash,
+        solana_keypair::Keypair,
         solana_message::Message,
         solana_sha256_hasher::hash,
         solana_transaction::Transaction,
@@ -954,6 +956,45 @@ pub mod tests {
         blockstore
             .purge_special_columns_exact(&mut write_batch, slot, slot + 1)
             .unwrap();
+    }
+
+    #[test]
+    fn test_purge_special_columns_exact_removes_txid_entries() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let slot = 1;
+        let recent_blockhash = Hash::new_unique();
+        let transaction = create_test_v1_transaction(&Keypair::new(), recent_blockhash);
+        let txid = transaction.transaction_id();
+        let compatibility_signature = transaction.signatures[0];
+        let entry = next_versioned_entry(&recent_blockhash, 1, vec![transaction]);
+        let shreds = entries_to_test_shreds(&[entry], slot, slot - 1, true, 0);
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+        blockstore
+            .write_transaction_status_with_id(
+                slot,
+                compatibility_signature,
+                txid,
+                std::iter::empty(),
+                TransactionStatusMeta::default(),
+                0,
+            )
+            .unwrap();
+        assert!(blockstore.transaction_ids_cf.get((txid, slot)).unwrap().is_some());
+
+        let mut write_batch = blockstore.get_write_batch().unwrap();
+        blockstore
+            .purge_special_columns_exact(&mut write_batch, slot, slot)
+            .unwrap();
+        blockstore.write_batch(write_batch).unwrap();
+
+        assert!(blockstore.transaction_ids_cf.get((txid, slot)).unwrap().is_none());
+        assert!(blockstore
+            .transaction_status_cf
+            .get_protobuf((compatibility_signature, slot))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

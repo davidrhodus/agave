@@ -7654,6 +7654,7 @@ dependencies = [
 name = "solana-banks-client"
 version = "3.1.11"
 dependencies = [
+ "agave-feature-set",
  "agave-native-auth",
  "borsh",
  "futures 0.3.31",
@@ -10383,6 +10384,7 @@ dependencies = [
  "agave-native-auth",
  "agave-reserved-account-keys",
  "agave-snapshots",
+ "agave-transaction-view",
  "base64 0.22.1",
  "bincode",
  "bs58",
@@ -10611,7 +10613,11 @@ dependencies = [
 name = "solana-rpc-test"
 version = "3.1.11"
 dependencies = [
+ "agave-feature-set",
  "agave-logger",
+ "agave-native-auth",
+ "agave-transaction-view",
+ "base64 0.22.1",
  "bincode",
  "bs58",
  "crossbeam-channel",
@@ -10627,6 +10633,7 @@ dependencies = [
  "solana-connection-cache",
  "solana-hash 3.1.0",
  "solana-keypair",
+ "solana-message",
  "solana-net-utils",
  "solana-pubkey 3.0.0",
  "solana-pubsub-client",
@@ -10634,10 +10641,13 @@ dependencies = [
  "solana-rpc",
  "solana-rpc-client",
  "solana-rpc-client-api",
+ "solana-rpc-client-types",
  "solana-signature",
  "solana-signer",
  "solana-streamer",
+ "solana-system-interface 2.0.0",
  "solana-system-transaction",
+ "solana-sysvar",
  "solana-test-validator",
  "solana-tpu-client",
  "solana-transaction",
@@ -10652,6 +10662,7 @@ dependencies = [
  "agave-feature-set",
  "agave-fs",
  "agave-logger",
+ "agave-native-auth",
  "agave-precompiles",
  "agave-reserved-account-keys",
  "agave-snapshots",
@@ -10938,6 +10949,7 @@ dependencies = [
 name = "solana-send-transaction-service"
 version = "3.1.11"
 dependencies = [
+ "agave-feature-set",
  "agave-logger",
  "agave-native-auth",
  "async-trait",
@@ -10953,6 +10965,7 @@ dependencies = [
  "solana-hash 3.1.0",
  "solana-keypair",
  "solana-measure",
+ "solana-message",
  "solana-metrics",
  "solana-net-utils",
  "solana-nonce",
@@ -10962,10 +10975,12 @@ dependencies = [
  "solana-runtime",
  "solana-signature",
  "solana-signer",
+ "solana-slot-hashes",
  "solana-system-interface 2.0.0",
  "solana-system-transaction",
  "solana-time-utils",
  "solana-tpu-client-next",
+ "solana-transaction",
  "tokio",
  "tokio-util 0.7.16",
 ]
@@ -11821,8 +11836,10 @@ dependencies = [
  "anyhow",
  "bincode",
  "borsh",
+ "ml-dsa",
  "serde",
  "serde_derive",
+ "signature 3.0.0-rc.10",
  "solana-address 2.0.0",
  "solana-frozen-abi",
  "solana-frozen-abi-macro",

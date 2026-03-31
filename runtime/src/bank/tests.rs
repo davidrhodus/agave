@@ -19,9 +19,11 @@ use {
         stakes::InvalidCacheEntryReason,
         status_cache::MAX_CACHE_ENTRIES,
     },
+    agave_native_auth::{
+        compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+    },
     agave_feature_set::{self as feature_set, FeatureSet},
     agave_reserved_account_keys::ReservedAccount,
-    agave_transaction_view::static_account_keys_frame::MAX_STATIC_ACCOUNTS_PER_PACKET,
     ahash::AHashMap,
     assert_matches::assert_matches,
     crossbeam_channel::{bounded, unbounded},
@@ -69,7 +71,8 @@ use {
     },
     solana_loader_v4_interface::{instruction as loader_v4, state::LoaderV4State},
     solana_message::{
-        compiled_instruction::CompiledInstruction, Message, MessageHeader, SanitizedMessage,
+        compiled_instruction::CompiledInstruction, v0, Message, MessageHeader, SanitizedMessage,
+        VersionedMessage,
     },
     solana_native_token::LAMPORTS_PER_SOL,
     solana_nonce::{self as nonce, state::DurableNonce},
@@ -90,6 +93,7 @@ use {
     solana_sha256_hasher::hash,
     solana_signature::Signature,
     solana_signer::Signer,
+    solana_slot_hashes::SlotHashes,
     solana_stake_interface::{
         instruction as stake_instruction, program as stake_program,
         state::{Authorized, Delegation, Lockup, Stake, StakeStateV2},
@@ -140,6 +144,9 @@ use {
     },
     test_case::test_case,
 };
+
+const MAX_STATIC_ACCOUNTS_PER_PACKET: u8 =
+    (solana_packet::PACKET_DATA_SIZE / core::mem::size_of::<Pubkey>()) as u8;
 
 impl VoteReward {
     pub fn new_random() -> Self {
@@ -192,6 +199,39 @@ pub(in crate::bank) fn create_genesis_config(lamports: u64) -> (GenesisConfig, K
 pub(in crate::bank) fn new_sanitized_message(message: Message) -> SanitizedMessage {
     SanitizedMessage::try_from_legacy_message(message, &ReservedAccountKeys::empty_key_set())
         .unwrap()
+}
+
+fn create_test_v1_transfer(
+    signer: &Keypair,
+    recipient: &Pubkey,
+    recent_blockhash: Hash,
+) -> solana_transaction::versioned::VersionedTransaction {
+    let message = VersionedMessage::V0(
+        v0::Message::try_compile(
+            &signer.pubkey(),
+            &[system_instruction::transfer(&signer.pubkey(), recipient, 1)],
+            &[],
+            recent_blockhash,
+        )
+        .unwrap(),
+    );
+    let verifier_key = signer.pubkey().to_bytes().to_vec();
+    let txid = compute_transaction_id(
+        &message.serialize(),
+        [NativeAuthDescriptor {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key: &verifier_key,
+        }],
+    );
+    solana_transaction::versioned::VersionedTransaction::try_new_v1(
+        message,
+        vec![NativeAuthEntry {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key,
+            proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+        }],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -9174,6 +9214,31 @@ fn test_verify_transactions_instruction_limit(simd_0160_enabled: bool) {
             .verify_transaction(tx.into(), TransactionVerificationMode::FullVerification)
             .is_ok());
     }
+}
+
+#[test]
+fn test_v1_transaction_status_cache_is_txid_only() {
+    let (genesis_config, mint_keypair) = create_genesis_config_no_tx_fee_no_rent(10_000);
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut child_bank =
+        Bank::new_from_parent(bank, &Pubkey::default(), /*slot:*/ 1);
+    child_bank.activate_feature(&feature_set::enable_transaction_v1_native_auth::id());
+    child_bank.set_sysvar_for_tests(&SlotHashes::default());
+    let bank = bank_forks
+        .write()
+        .unwrap()
+        .insert(child_bank)
+        .clone_without_scheduler();
+
+    let recipient = Pubkey::new_unique();
+    let transaction = create_test_v1_transfer(&mint_keypair, &recipient, bank.last_blockhash());
+    let txid = transaction.transaction_id();
+    let compatibility_signature = transaction.signatures[0];
+
+    bank.process_transaction_with_metadata(transaction).unwrap();
+
+    assert_eq!(bank.get_transaction_status_slot(&txid).map(|(slot, _)| slot), Some(1));
+    assert!(bank.get_signature_status_slot(&compatibility_signature).is_none());
 }
 
 #[test]

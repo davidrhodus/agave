@@ -586,6 +586,9 @@ mod tests {
     use {
         super::*,
         crate::banking_stage::tests::create_slow_genesis_config,
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+        },
         crossbeam_channel::{unbounded, Receiver},
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -601,6 +604,32 @@ mod tests {
         solana_system_transaction::transfer,
         solana_transaction::versioned::VersionedTransaction,
     };
+
+    fn create_test_v1_transaction(
+        signer: &Keypair,
+        recent_blockhash: Hash,
+    ) -> VersionedTransaction {
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&signer.pubkey(), &[], &[], recent_blockhash).unwrap(),
+        );
+        let verifier_key = signer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+            }],
+        )
+        .unwrap()
+    }
 
     fn test_bank_forks() -> (Arc<RwLock<BankForks>>, Keypair) {
         let GenesisConfigInfo {
@@ -686,6 +715,31 @@ mod tests {
         let r = receive_and_buffer
             .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_translate_to_runtime_view_rejects_v1_when_feature_inactive() {
+        let (bank_forks, mint_keypair) = test_bank_forks();
+        let mut feature_off_bank = Bank::new_from_parent(
+            bank_forks.read().unwrap().root_bank(),
+            &Pubkey::default(),
+            1,
+        );
+        feature_off_bank.deactivate_feature(&enable_transaction_v1_native_auth::id());
+        let feature_off_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(feature_off_bank)
+            .clone_without_scheduler();
+
+        let transaction =
+            create_test_v1_transaction(&mint_keypair, feature_off_bank.last_blockhash());
+        let bytes = bincode::serialize(&transaction).unwrap();
+
+        assert!(matches!(
+            translate_to_runtime_view(&bytes[..], &feature_off_bank, &feature_off_bank, true, 64),
+            Err(PacketHandlingError::Sanitization)
+        ));
     }
 
     #[test]

@@ -514,7 +514,12 @@ mod serde_impl {
 mod tests {
     use {
         super::*,
-        agave_native_auth::NativeAuthScheme,
+        agave_native_auth::{
+            compute_transaction_id, derive_signer_address, NativeAuthDescriptor,
+            NativeAuthScheme, TransactionIdentifier,
+        },
+        ml_dsa::KeyGen,
+        signature::{Keypair as _, SignatureEncoding, Signer as _},
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
@@ -574,12 +579,20 @@ mod tests {
         let message = VersionedMessage::V0(
             v0::Message::try_compile(&keypair.pubkey(), &[], &[], Hash::new_unique()).unwrap(),
         );
-        let proof = keypair.sign_message(&message.serialize());
+        let verifier_key = keypair.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let proof = keypair.sign_message(txid.as_ref());
         let tx = VersionedTransaction::try_new_v1(
             message,
             vec![NativeAuthEntry {
                 scheme: NativeAuthScheme::Ed25519,
-                verifier_key: keypair.pubkey().to_bytes().to_vec(),
+                verifier_key,
                 proof: proof.as_ref().to_vec(),
             }],
         )
@@ -587,6 +600,135 @@ mod tests {
         assert!(tx.is_v1());
         assert_eq!(tx.version(), TransactionVersion::Number(1));
         assert_eq!(tx.verify_with_results(), vec![true]);
+    }
+
+    #[test]
+    fn test_try_new_v1_roundtrip_preserves_txid_and_entries() {
+        let keypair = Keypair::new();
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&keypair.pubkey(), &[], &[], Hash::new_unique()).unwrap(),
+        );
+        let verifier_key = keypair.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let tx = VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: keypair.sign_message(txid.as_ref()).as_ref().to_vec(),
+            }],
+        )
+        .unwrap();
+
+        let bytes = bincode::serialize(&tx).unwrap();
+        let (
+            escape_prefix,
+            version,
+            solana_short_vec::ShortVec(native_auth_entries),
+            decoded_message,
+        ): (
+            u8,
+            u8,
+            solana_short_vec::ShortVec<NativeAuthEntry>,
+            VersionedMessage,
+        ) = bincode::deserialize(&bytes).unwrap();
+        let decoded = VersionedTransaction::try_new_v1(decoded_message, native_auth_entries).unwrap();
+        assert_eq!(escape_prefix, TRANSACTION_V1_ESCAPE_PREFIX);
+        assert_eq!(version, TRANSACTION_V1_NUMBER);
+        assert_eq!(decoded.signatures, tx.signatures);
+        assert_eq!(decoded.native_auth_entries, tx.native_auth_entries);
+        assert_eq!(decoded.transaction_identifier(), tx.transaction_identifier());
+        assert_eq!(decoded.verify_with_results(), vec![true]);
+    }
+
+    #[test]
+    fn test_try_new_v1_mixed_scheme_multisig() {
+        let ed_keypair = Keypair::new();
+        let ml_seed: ml_dsa::Seed = [7u8; 32].into();
+        let ml_keypair = ml_dsa::MlDsa44::from_seed(&ml_seed);
+        let ml_verifier_key = ml_keypair.verifying_key().encode().as_slice().to_vec();
+        let ml_signer = derive_signer_address(NativeAuthScheme::MlDsa44, &ml_verifier_key).unwrap();
+        let message = VersionedMessage::V0(v0::Message {
+            header: solana_message::MessageHeader {
+                num_required_signatures: 2,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![ed_keypair.pubkey(), ml_signer],
+            recent_blockhash: Hash::new_unique(),
+            instructions: vec![],
+            address_table_lookups: vec![],
+        });
+        let ed_verifier_key = ed_keypair.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [
+                NativeAuthDescriptor {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key: &ed_verifier_key,
+                },
+                NativeAuthDescriptor {
+                    scheme: NativeAuthScheme::MlDsa44,
+                    verifier_key: &ml_verifier_key,
+                },
+            ],
+        );
+        let tx = VersionedTransaction::try_new_v1(
+            message,
+            vec![
+                NativeAuthEntry {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key: ed_verifier_key,
+                    proof: ed_keypair.sign_message(txid.as_ref()).as_ref().to_vec(),
+                },
+                NativeAuthEntry {
+                    scheme: NativeAuthScheme::MlDsa44,
+                    verifier_key: ml_verifier_key,
+                    proof: ml_keypair.signing_key().sign(txid.as_ref()).to_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(tx.verify_with_results(), vec![true, true]);
+        assert_eq!(tx.transaction_identifier(), TransactionIdentifier::Txid(txid));
+    }
+
+    #[test]
+    fn test_try_new_v1_rejects_wrong_signer_count() {
+        let keypair = Keypair::new();
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&keypair.pubkey(), &[], &[], Hash::new_unique()).unwrap(),
+        );
+
+        assert_eq!(
+            VersionedTransaction::try_new_v1(message.clone(), vec![]),
+            Err(SanitizeError::IndexOutOfBounds)
+        );
+        assert_eq!(
+            VersionedTransaction::try_new_v1(
+                message,
+                vec![
+                    NativeAuthEntry {
+                        scheme: NativeAuthScheme::Ed25519,
+                        verifier_key: vec![1u8; 32],
+                        proof: vec![2u8; 64],
+                    },
+                    NativeAuthEntry {
+                        scheme: NativeAuthScheme::Ed25519,
+                        verifier_key: vec![3u8; 32],
+                        proof: vec![4u8; 64],
+                    },
+                ],
+            ),
+            Err(SanitizeError::InvalidValue)
+        );
     }
 
     fn nonced_transfer_tx() -> (Pubkey, Pubkey, VersionedTransaction) {

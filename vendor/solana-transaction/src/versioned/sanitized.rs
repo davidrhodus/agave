@@ -1,11 +1,12 @@
 use {
     crate::versioned::VersionedTransaction,
     agave_native_auth::NativeAuthEntry,
-    solana_hash::Hash,
     solana_message::SanitizedVersionedMessage,
     solana_sanitize::SanitizeError,
     solana_signature::Signature,
 };
+#[cfg(feature = "blake3")]
+use solana_hash::Hash;
 
 /// Wraps a sanitized `VersionedTransaction` to provide a safe API
 #[derive(Clone, Debug, PartialEq, Eq)]

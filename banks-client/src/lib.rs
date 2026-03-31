@@ -553,7 +553,12 @@ pub async fn start_tcp_client<T: ToSocketAddrs>(addr: T) -> Result<BanksClient, 
 mod tests {
     use {
         super::*,
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+        },
         solana_banks_server::banks_server::start_local_server,
+        solana_hash::Hash,
+        solana_message::{v0, VersionedMessage},
         solana_runtime::{
             bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache,
             genesis_utils::create_genesis_config,
@@ -568,6 +573,39 @@ mod tests {
             time::{sleep, Duration},
         },
     };
+
+    fn create_test_v1_transfer(
+        signer: &impl Signer,
+        recipient: &Pubkey,
+        recent_blockhash: Hash,
+    ) -> VersionedTransaction {
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(
+                &signer.pubkey(),
+                &[system_instruction::transfer(&signer.pubkey(), recipient, 1)],
+                &[],
+                recent_blockhash,
+            )
+            .unwrap(),
+        );
+        let verifier_key = signer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+            }],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_banks_client_new() {
@@ -659,6 +697,43 @@ mod tests {
             }
             assert!(status.unwrap().err.is_none());
             assert_eq!(banks_client.get_balance(bob_pubkey).await?, 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn test_banks_server_rejects_v1_when_feature_inactive() -> Result<(), BanksClientError> {
+        let genesis = create_genesis_config(10);
+        let mut bank = Bank::new_for_tests(&genesis.genesis_config);
+        bank.deactivate_feature(&agave_feature_set::enable_transaction_v1_native_auth::id());
+        let slot = bank.slot();
+        let block_commitment_cache = Arc::new(RwLock::new(
+            BlockCommitmentCache::new_for_tests_with_slots(slot, slot),
+        ));
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let recipient = Pubkey::new_unique();
+
+        Runtime::new()?.block_on(async {
+            let client_transport =
+                start_local_server(bank_forks, block_commitment_cache, Duration::from_millis(1))
+                    .await;
+            let banks_client = start_client(client_transport).await?;
+            let recent_blockhash = banks_client.get_latest_blockhash().await?;
+            let transaction =
+                create_test_v1_transfer(&genesis.mint_keypair, &recipient, recent_blockhash);
+
+            let err = banks_client
+                .process_transaction_with_commitment(
+                    transaction,
+                    solana_commitment_config::CommitmentLevel::Processed,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.unwrap(),
+                solana_transaction_error::TransactionError::UnsupportedVersion
+            );
             Ok(())
         })
     }

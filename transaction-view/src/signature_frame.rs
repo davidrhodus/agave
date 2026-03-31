@@ -182,4 +182,60 @@ mod tests {
         assert_eq!(frame.native_auth_entries().len(), 1);
         assert_eq!(offset, bytes.len());
     }
+
+    #[test]
+    fn test_v1_rejects_invalid_scheme_tag() {
+        let bytes = vec![1, 99, 32, 0, 64, 0];
+        let mut offset = 0;
+        assert!(SignatureFrame::try_new_v1(&bytes, &mut offset).is_err());
+    }
+
+    #[test]
+    fn test_v1_rejects_truncated_verifier_key() {
+        let bytes = vec![1, NativeAuthScheme::Ed25519 as u8, 32, 1, 2, 3];
+        let mut offset = 0;
+        assert!(SignatureFrame::try_new_v1(&bytes, &mut offset).is_err());
+    }
+
+    #[test]
+    fn test_v1_rejects_truncated_proof() {
+        let mut bytes = vec![1, NativeAuthScheme::Ed25519 as u8, 32];
+        bytes.extend_from_slice(&[1u8; 32]);
+        bytes.push(64);
+        bytes.extend_from_slice(&[2u8; 16]);
+        let mut offset = 0;
+        assert!(SignatureFrame::try_new_v1(&bytes, &mut offset).is_err());
+    }
+
+    #[test]
+    fn test_v1_finalize_derives_txid_and_compat_signatures() {
+        let bytes = bincode::serialize(&ShortVec(vec![
+            NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: vec![1u8; 32],
+                proof: vec![2u8; 64],
+            },
+            NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: vec![3u8; 32],
+                proof: vec![4u8; 64],
+            },
+        ]))
+        .unwrap();
+        let mut offset = 0;
+        let mut frame = SignatureFrame::try_new_v1(&bytes, &mut offset).unwrap();
+        let message_bytes = b"test-message";
+        frame.finalize_v1(message_bytes);
+
+        let expected_txid = compute_transaction_id(
+            message_bytes,
+            frame.native_auth_entries().iter().map(NativeAuthEntry::descriptor),
+        );
+        assert_eq!(frame.transaction_id(), Some(&expected_txid));
+        assert_eq!(offset, bytes.len());
+
+        // SAFETY: v1 frames synthesize compatibility signatures from in-memory state.
+        let signatures = unsafe { frame.signatures(&bytes) };
+        assert_eq!(signatures, compatibility_signatures(&expected_txid, 2));
+    }
 }

@@ -155,6 +155,12 @@ features = [
 ]
 default-features = false
 
+[dev-dependencies.ml-dsa]
+version = "0.1.0-rc.8"
+
+[dev-dependencies.signature]
+version = "3.0.0-rc.10"
+
 [dev-dependencies.solana-hash]
 version = "4.0.0"
 features = ["atomic"]

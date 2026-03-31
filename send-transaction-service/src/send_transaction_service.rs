@@ -531,23 +531,59 @@ impl SendTransactionService {
 mod test {
     use {
         super::*,
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+            TransactionIdentifier,
+        },
         crate::{
-            test_utils::ClientWithCreator,
+            test_utils::{ClientWithCreator, CreateClient, Stoppable},
             tpu_info::NullTpuInfo,
             transaction_client::{ConnectionCacheClient, TpuClientNextClient},
         },
         crossbeam_channel::{bounded, unbounded},
         solana_account::AccountSharedData,
         solana_genesis_config::create_genesis_config,
+        solana_message::{v0, VersionedMessage},
         solana_nonce::{self as nonce, state::DurableNonce},
         solana_pubkey::Pubkey,
         solana_signature::Signature,
         solana_signer::Signer,
+        solana_slot_hashes::SlotHashes,
         solana_system_interface::program as system_program,
         solana_system_transaction as system_transaction,
+        solana_transaction::versioned::VersionedTransaction,
         std::ops::Sub,
         tokio::runtime::Handle,
     };
+
+    fn create_test_v1_transaction(signer: &solana_keypair::Keypair, blockhash: Hash) -> VersionedTransaction {
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(
+                &signer.pubkey(),
+                &[],
+                &[],
+                blockhash,
+            )
+            .unwrap(),
+        );
+        let verifier_key = signer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+            }],
+        )
+        .unwrap()
+    }
 
     fn service_exit<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
         let bank = Bank::default_for_tests();
@@ -702,12 +738,12 @@ mod test {
             (transaction, signature)
         };
 
-        let mut transactions = HashMap::new();
+        let mut transactions: HashMap<TransactionIdentifier, TransactionInfo> = HashMap::new();
 
         info!("Expired transactions are dropped...");
         let stats = SendTransactionServiceStats::default();
         transactions.insert(
-            Signature::default(),
+            Signature::default().into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -745,7 +781,7 @@ mod test {
 
         info!("Rooted transactions are dropped...");
         transactions.insert(
-            rooted_signature,
+            rooted_signature.into(),
             TransactionInfo::new(
                 rooted_transaction.message.hash(),
                 rooted_signature,
@@ -776,7 +812,7 @@ mod test {
 
         info!("Failed transactions are dropped...");
         transactions.insert(
-            failed_signature,
+            failed_signature.into(),
             TransactionInfo::new(
                 failed_transaction.message.hash(),
                 failed_signature,
@@ -807,7 +843,7 @@ mod test {
 
         info!("Non-rooted transactions are kept...");
         transactions.insert(
-            non_rooted_signature,
+            non_rooted_signature.into(),
             TransactionInfo::new(
                 non_rooted_transaction.message.hash(),
                 non_rooted_signature,
@@ -839,7 +875,7 @@ mod test {
 
         info!("Unknown transactions are retried...");
         transactions.insert(
-            Signature::default(),
+            Signature::default().into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -872,7 +908,7 @@ mod test {
 
         info!("Transactions are only retried until max_retries");
         transactions.insert(
-            Signature::from([1; 64]),
+            Signature::from([1; 64]).into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -885,7 +921,7 @@ mod test {
             ),
         );
         transactions.insert(
-            Signature::from([2; 64]),
+            Signature::from([2; 64]).into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -920,6 +956,82 @@ mod test {
     #[test]
     fn process_transactions_with_connection_cache() {
         process_transactions::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[test]
+    fn process_transactions_uses_txid_for_v1_rooted_status() {
+        agave_logger::setup();
+
+        let (mut genesis_config, mint_keypair) = create_genesis_config(4);
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
+        let (_, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+        let mut root_bank =
+            Bank::new_from_parent(bank_forks.read().unwrap().working_bank(), &Pubkey::default(), 1);
+        root_bank.activate_feature(&agave_feature_set::enable_transaction_v1_native_auth::id());
+        root_bank.set_sysvar_for_tests(&SlotHashes::default());
+        let root_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(root_bank)
+            .clone_without_scheduler();
+
+        let transaction = create_test_v1_transaction(&mint_keypair, root_bank.last_blockhash());
+        let txid = transaction.transaction_id();
+        root_bank
+            .process_transaction_with_metadata(transaction.clone())
+            .unwrap();
+
+        let working_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(
+                root_bank.clone(),
+                &Pubkey::default(),
+                2,
+            ))
+            .clone_without_scheduler();
+
+        let mut transactions: HashMap<TransactionIdentifier, TransactionInfo> = HashMap::new();
+        transactions.insert(
+            TransactionIdentifier::Txid(txid),
+            TransactionInfo::new(
+                txid,
+                TransactionIdentifier::Txid(txid),
+                root_bank.last_blockhash(),
+                vec![],
+                working_bank.block_height(),
+                None,
+                None,
+                Some(Instant::now()),
+            ),
+        );
+
+        let client = ConnectionCacheClient::<NullTpuInfo>::create_client(
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            1,
+        );
+        let stats = SendTransactionServiceStats::default();
+        let result = SendTransactionService::process_transactions(
+            &working_bank,
+            &root_bank,
+            &mut transactions,
+            &client,
+            &Config::default(),
+            &stats,
+        );
+
+        assert!(transactions.is_empty());
+        assert_eq!(
+            result,
+            ProcessTransactionsResult {
+                rooted: 1,
+                ..ProcessTransactionsResult::default()
+            }
+        );
+        client.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1001,11 +1113,11 @@ mod test {
             (transaction, signature)
         };
 
-        let mut transactions = HashMap::new();
+        let mut transactions: HashMap<TransactionIdentifier, TransactionInfo> = HashMap::new();
 
         info!("Rooted durable-nonce transactions are dropped...");
         transactions.insert(
-            rooted_signature,
+            rooted_signature.into(),
             TransactionInfo::new(
                 rooted_transaction.message.hash(),
                 rooted_signature,
@@ -1042,7 +1154,7 @@ mod test {
         );
         // Nonce expired case
         transactions.insert(
-            rooted_signature,
+            rooted_signature.into(),
             TransactionInfo::new(
                 rooted_transaction.message.hash(),
                 rooted_signature,
@@ -1074,7 +1186,7 @@ mod test {
         // Expired durable-nonce transactions are dropped; nonce has advanced...
         info!("Expired durable-nonce transactions are dropped...");
         transactions.insert(
-            Signature::default(),
+            Signature::default().into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -1104,7 +1216,7 @@ mod test {
         );
         // ... or last_valid_block_height timeout has passed
         transactions.insert(
-            Signature::default(),
+            Signature::default().into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),
@@ -1135,7 +1247,7 @@ mod test {
 
         info!("Failed durable-nonce transactions are dropped...");
         transactions.insert(
-            failed_signature,
+            failed_signature.into(),
             TransactionInfo::new(
                 failed_transaction.message.hash(),
                 failed_signature,
@@ -1166,7 +1278,7 @@ mod test {
 
         info!("Non-rooted durable-nonce transactions are kept...");
         transactions.insert(
-            non_rooted_signature,
+            non_rooted_signature.into(),
             TransactionInfo::new(
                 non_rooted_transaction.message.hash(),
                 non_rooted_signature,
@@ -1199,7 +1311,7 @@ mod test {
         info!("Unknown durable-nonce transactions are retried until nonce advances...");
         // simulate there was a nonce transaction sent 4 seconds ago (> the retry rate which is 2 seconds)
         transactions.insert(
-            Signature::default(),
+            Signature::default().into(),
             TransactionInfo::new(
                 Hash::default(),
                 Signature::default(),

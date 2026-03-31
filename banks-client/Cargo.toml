@@ -43,6 +43,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-serde = { workspace = true, features = ["bincode"] }
 
 [dev-dependencies]
+agave-feature-set = { workspace = true }
 solana-banks-server = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }

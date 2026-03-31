@@ -1,4 +1,9 @@
 use {
+    agave_transaction_view::transaction_view::UnsanitizedTransactionView,
+    agave_native_auth::{
+        compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+    },
+    base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _},
     bincode::serialize,
     crossbeam_channel::unbounded,
     futures_util::StreamExt,
@@ -10,6 +15,7 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_hash::Hash,
     solana_keypair::Keypair,
+    solana_message::{v0, VersionedMessage},
     solana_net_utils::sockets::bind_to_localhost_unique,
     solana_pubkey::Pubkey,
     solana_pubsub_client::nonblocking::pubsub_client::PubsubClient,
@@ -17,17 +23,21 @@ use {
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         client_error::{ErrorKind as ClientErrorKind, Result as ClientResult},
-        config::{RpcAccountInfoConfig, RpcSignatureSubscribeConfig, RpcSimulateTransactionConfig},
+        config::{
+            RpcAccountInfoConfig, RpcSignatureSubscribeConfig, RpcSimulateTransactionConfig,
+        },
         request::RpcError,
         response::{Response as RpcResponse, RpcSignatureResult, SlotUpdate},
     },
     solana_signature::Signature,
     solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_sysvar::slot_hashes,
+    solana_system_interface::instruction as system_instruction,
     solana_system_transaction as system_transaction,
-    solana_test_validator::TestValidator,
+    solana_test_validator::{TestValidator, TestValidatorGenesis},
     solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig, DEFAULT_TPU_CONNECTION_POOL_SIZE},
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     solana_transaction_status::TransactionStatus,
     std::{
         collections::HashSet,
@@ -61,6 +71,47 @@ fn post_rpc(request: Value, rpc_url: &str) -> Value {
         .send()
         .unwrap();
     serde_json::from_str(&response.text().unwrap()).unwrap()
+}
+
+fn create_test_v1_transfer_transaction(
+    signer: &Keypair,
+    recipient: &Pubkey,
+    recent_blockhash: Hash,
+) -> VersionedTransaction {
+    let message = VersionedMessage::V0(
+        v0::Message::try_compile(
+            &signer.pubkey(),
+            &[system_instruction::transfer(
+                &signer.pubkey(),
+                recipient,
+                Rent::default().minimum_balance(0),
+            )],
+            &[],
+            recent_blockhash,
+        )
+        .unwrap(),
+    );
+    let verifier_key = signer.pubkey().to_bytes().to_vec();
+    let txid = compute_transaction_id(
+        &message.serialize(),
+        [NativeAuthDescriptor {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key: &verifier_key,
+        }],
+    );
+    VersionedTransaction::try_new_v1(
+        message,
+        vec![NativeAuthEntry {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key,
+            proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+        }],
+    )
+    .unwrap()
+}
+
+fn encode_base64_versioned_transaction(transaction: &VersionedTransaction) -> String {
+    BASE64_STANDARD.encode(serialize(transaction).unwrap())
 }
 
 #[test]
@@ -583,4 +634,121 @@ fn deserialize_rpc_error() -> ClientResult<()> {
             panic!()
         }
     }
+}
+
+#[test]
+fn test_rpc_v1_transaction_e2e() {
+    agave_logger::setup();
+
+    let (test_validator, payer) = TestValidatorGenesis::default().start();
+    let rpc_url = test_validator.rpc_url();
+    let rpc_client = RpcClient::new(rpc_url.clone());
+    let recipient = Pubkey::new_unique();
+    let slot_hashes_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < slot_hashes_deadline {
+        if rpc_client.get_account(&slot_hashes::id()).is_ok() {
+            break;
+        }
+        sleep(Duration::from_millis(250));
+    }
+    assert!(rpc_client.get_account(&slot_hashes::id()).is_ok());
+    let blockhash = rpc_client.get_latest_blockhash().unwrap();
+    assert!(rpc_client.get_balance(&payer.pubkey()).unwrap() > 0);
+    let transaction = create_test_v1_transfer_transaction(&payer, &recipient, blockhash);
+    let txid = transaction.transaction_id();
+    let txid_str = txid.to_string();
+    let compatibility_signature = transaction.signatures[0];
+    let serialized_transaction = serialize(&transaction).unwrap();
+    let transaction_view =
+        UnsanitizedTransactionView::try_new_unsanitized(serialized_transaction.as_slice()).unwrap();
+    assert!(matches!(
+        transaction_view.version(),
+        agave_transaction_view::transaction_version::TransactionVersion::V1
+    ));
+    assert_eq!(transaction_view.static_account_keys()[0], payer.pubkey());
+    assert_eq!(transaction_view.signatures()[0], compatibility_signature);
+    assert_eq!(transaction_view.num_address_table_lookups(), 0);
+    let send_request = json_req!(
+        "sendTransaction",
+        json!([
+            encode_base64_versioned_transaction(&transaction),
+            {
+                "encoding": "base64",
+            }
+        ])
+    );
+
+    let json = post_rpc(send_request.clone(), &rpc_url);
+    assert_eq!(
+        json["result"].as_str(),
+        Some(txid_str.as_str()),
+        "sendTransaction response: {json}"
+    );
+
+    let status_deadline = Instant::now() + Duration::from_secs(10);
+    let mut status_found = false;
+    while Instant::now() < status_deadline {
+        let json = post_rpc(
+            json_req!("getTransactionStatusesById", json!([[txid_str],])),
+            &rpc_url,
+        );
+        if let Some(status) = json["result"]["value"][0].as_object() {
+            assert!(status["err"].is_null());
+            status_found = true;
+            break;
+        }
+        sleep(Duration::from_millis(250));
+    }
+    assert!(status_found);
+
+    let compatibility_status = post_rpc(
+        json_req!(
+            "getSignatureStatuses",
+            json!([[compatibility_signature.to_string()]])
+        ),
+        &rpc_url,
+    );
+    assert!(compatibility_status["result"]["value"][0].is_null());
+
+}
+
+#[test]
+fn test_rpc_v1_transaction_feature_off_rejected() {
+    agave_logger::setup();
+
+    let (test_validator, payer) = TestValidatorGenesis::default()
+        .deactivate_features(&[agave_feature_set::enable_transaction_v1_native_auth::id()])
+        .start();
+    let rpc_url = test_validator.rpc_url();
+    let rpc_client = RpcClient::new(rpc_url.clone());
+    let transaction =
+        create_test_v1_transfer_transaction(&payer, &Pubkey::new_unique(), rpc_client.get_latest_blockhash().unwrap());
+    let txid = transaction.transaction_id().to_string();
+    let compatibility_signature = transaction.signatures[0].to_string();
+
+    let json = post_rpc(
+        json_req!(
+            "sendTransaction",
+            json!([
+                encode_base64_versioned_transaction(&transaction),
+                {
+                    "encoding": "base64",
+                }
+            ])
+        ),
+        &rpc_url,
+    );
+    assert!(json.get("error").is_some());
+
+    let status = post_rpc(
+        json_req!("getTransactionStatusesById", json!([[txid]])),
+        &rpc_url,
+    );
+    assert!(status["result"]["value"][0].is_null());
+
+    let compatibility_status = post_rpc(
+        json_req!("getSignatureStatuses", json!([[compatibility_signature]])),
+        &rpc_url,
+    );
+    assert!(compatibility_status["result"]["value"][0].is_null());
 }

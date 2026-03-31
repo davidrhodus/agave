@@ -8,6 +8,7 @@ use {
         parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
     },
     agave_native_auth::TransactionIdentifier,
+    agave_transaction_view::transaction_view::UnsanitizedTransactionView,
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
@@ -3986,7 +3987,7 @@ pub mod rpc_full {
                 ))
             })?;
             let (wire_transaction, unsanitized_tx) =
-                decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+                decode_and_deserialize_versioned_transaction(data, binary_encoding)?;
             if unsanitized_tx.is_v1() && binary_encoding == TransactionBinaryEncoding::Base58 {
                 return Err(Error::invalid_params(
                     "transaction version 1 requires base64 encoding",
@@ -4152,7 +4153,7 @@ pub mod rpc_full {
                 ))
             })?;
             let (_, mut unsanitized_tx) =
-                decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+                decode_and_deserialize_versioned_transaction(data, binary_encoding)?;
             if unsanitized_tx.is_v1() && binary_encoding == TransactionBinaryEncoding::Base58 {
                 return Err(Error::invalid_params(
                     "transaction version 1 requires base64 encoding",
@@ -4572,13 +4573,10 @@ fn max_serialized_transaction_size<T: 'static>() -> usize {
     }
 }
 
-fn decode_and_deserialize<T>(
+fn decode_binary_payload<T: 'static>(
     encoded: String,
     encoding: TransactionBinaryEncoding,
-) -> Result<(Vec<u8>, T)>
-where
-    T: serde::de::DeserializeOwned + 'static,
-{
+) -> Result<Vec<u8>> {
     let max_serialized_size = max_serialized_transaction_size::<T>();
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
@@ -4621,6 +4619,90 @@ where
             max_serialized_size
         )));
     }
+    Ok(wire_output)
+}
+
+fn transaction_view_to_versioned_transaction(
+    transaction: &UnsanitizedTransactionView<&[u8]>,
+) -> VersionedTransaction {
+    let header = solana_message::MessageHeader {
+        num_required_signatures: transaction.num_required_signatures(),
+        num_readonly_signed_accounts: transaction.num_readonly_signed_static_accounts(),
+        num_readonly_unsigned_accounts: transaction.num_readonly_unsigned_static_accounts(),
+    };
+    let static_account_keys = transaction.static_account_keys().to_vec();
+    let recent_blockhash = *transaction.recent_blockhash();
+    let instructions = transaction
+        .instructions_iter()
+        .map(|ix| solana_message::compiled_instruction::CompiledInstruction {
+            program_id_index: ix.program_id_index,
+            accounts: ix.accounts.to_vec(),
+            data: ix.data.to_vec(),
+        })
+        .collect();
+    let message = match transaction.version() {
+        agave_transaction_view::transaction_version::TransactionVersion::Legacy => {
+            solana_message::VersionedMessage::Legacy(solana_message::legacy::Message {
+                header,
+                account_keys: static_account_keys,
+                recent_blockhash,
+                instructions,
+            })
+        }
+        agave_transaction_view::transaction_version::TransactionVersion::V0
+        | agave_transaction_view::transaction_version::TransactionVersion::V1 => {
+            solana_message::VersionedMessage::V0(solana_message::v0::Message {
+                header,
+                account_keys: static_account_keys,
+                recent_blockhash,
+                instructions,
+                address_table_lookups: transaction
+                    .address_table_lookup_iter()
+                    .map(|atl| solana_message::v0::MessageAddressTableLookup {
+                        account_key: *atl.account_key,
+                        writable_indexes: atl.writable_indexes.to_vec(),
+                        readonly_indexes: atl.readonly_indexes.to_vec(),
+                    })
+                    .collect(),
+            })
+        }
+    };
+
+    VersionedTransaction {
+        signatures: transaction.signatures().to_vec(),
+        message,
+        native_auth_entries: transaction.native_auth_entries().to_vec(),
+    }
+}
+
+fn decode_and_deserialize_versioned_transaction(
+    encoded: String,
+    encoding: TransactionBinaryEncoding,
+) -> Result<(Vec<u8>, VersionedTransaction)> {
+    let wire_output = decode_binary_payload::<VersionedTransaction>(encoded, encoding)?;
+    let transaction = {
+        let view =
+            UnsanitizedTransactionView::try_new_unsanitized(&wire_output[..]).map_err(|err| {
+                Error::invalid_params(format!(
+                    "failed to deserialize {}: {:?}",
+                    type_name::<VersionedTransaction>(),
+                    err
+                ))
+            })?;
+        transaction_view_to_versioned_transaction(&view)
+    };
+    Ok((wire_output, transaction))
+}
+
+fn decode_and_deserialize<T>(
+    encoded: String,
+    encoding: TransactionBinaryEncoding,
+) -> Result<(Vec<u8>, T)>
+where
+    T: serde::de::DeserializeOwned + 'static,
+{
+    let wire_output = decode_binary_payload::<T>(encoded, encoding)?;
+    let max_serialized_size = max_serialized_transaction_size::<T>();
     bincode::options()
         .with_limit(max_serialized_size as u64)
         .with_fixint_encoding()

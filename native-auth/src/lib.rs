@@ -570,4 +570,196 @@ mod tests {
         );
         assert!(result.is_ok(), "{result:?}");
     }
+
+    #[test]
+    fn verify_entries_rejects_invalid_signer_count() {
+        let keypair = Ed25519Keypair::new();
+        let signer = keypair.pubkey();
+        let verifier_key = signer.to_bytes().to_vec();
+        let message = empty_message_bytes();
+        let txid = compute_transaction_id(
+            &message,
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let proof = keypair.sign_message(txid.as_ref());
+        let entry = NativeAuthEntry {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key,
+            proof: proof.as_ref().to_vec(),
+        };
+
+        assert_eq!(
+            verify_entries(&message, &[], [entry.as_ref()]),
+            Err(NativeAuthError::InvalidSignerCount {
+                expected: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn verify_entries_rejects_signer_address_mismatch() {
+        let keypair = Ed25519Keypair::new();
+        let verifier_key = keypair.pubkey().to_bytes().to_vec();
+        let message = empty_message_bytes();
+        let txid = compute_transaction_id(
+            &message,
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let proof = keypair.sign_message(txid.as_ref());
+        let entry = NativeAuthEntry {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key,
+            proof: proof.as_ref().to_vec(),
+        };
+
+        assert_eq!(
+            verify_entries(&message, &[Pubkey::new_unique()], [entry.as_ref()]),
+            Err(NativeAuthError::SignerAddressMismatch { index: 0 })
+        );
+    }
+
+    #[test]
+    fn verify_entries_rejects_tampered_ed25519_proof() {
+        let keypair = Ed25519Keypair::new();
+        let signer = keypair.pubkey();
+        let verifier_key = signer.to_bytes().to_vec();
+        let message = empty_message_bytes();
+        let txid = compute_transaction_id(
+            &message,
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let mut proof = keypair.sign_message(txid.as_ref()).as_ref().to_vec();
+        proof[0] ^= 1;
+        let entry = NativeAuthEntry {
+            scheme: NativeAuthScheme::Ed25519,
+            verifier_key,
+            proof,
+        };
+
+        assert_eq!(
+            verify_entries(&message, &[signer], [entry.as_ref()]),
+            Err(NativeAuthError::VerificationFailure { index: 0 })
+        );
+    }
+
+    #[test]
+    fn verify_entries_rejects_invalid_scheme_inputs() {
+        let message = empty_message_bytes();
+        let ed_verifier_key = [7u8; 32];
+        let ed_signer = Pubkey::new_from_array(ed_verifier_key);
+
+        assert_eq!(
+            NativeAuthScheme::try_from(9),
+            Err(NativeAuthError::UnknownScheme(9))
+        );
+        assert_eq!(
+            verify_entries(
+                &message,
+                &[ed_signer],
+                [NativeAuthEntryRef {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key: &[7u8; 31],
+                    proof: &[9u8; 64],
+                }],
+            ),
+            Err(NativeAuthError::InvalidEd25519VerifierKey)
+        );
+        assert_eq!(
+            verify_entries(
+                &message,
+                &[ed_signer],
+                [NativeAuthEntryRef {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key: &ed_verifier_key,
+                    proof: &[9u8; 1],
+                }],
+            ),
+            Err(NativeAuthError::VerificationFailure { index: 0 })
+        );
+
+        let ml_seed: ml_dsa::Seed = [3u8; 32].into();
+        let ml_keypair = MlDsa44::from_seed(&ml_seed);
+        let ml_verifier_key = ml_keypair.verifying_key().encode().as_slice().to_vec();
+        let ml_signer =
+            derive_signer_address(NativeAuthScheme::MlDsa44, &ml_verifier_key).unwrap();
+        assert_eq!(
+            validate_verifier_key(NativeAuthScheme::MlDsa44, &[1u8; 1]),
+            Err(NativeAuthError::InvalidMlDsa44VerifierKey)
+        );
+        assert!(matches!(
+            verify_entries(
+                &message,
+                &[ml_signer],
+                [NativeAuthEntryRef {
+                    scheme: NativeAuthScheme::MlDsa44,
+                    verifier_key: &ml_verifier_key,
+                    proof: &[2u8; 1],
+                }],
+            ),
+            Err(NativeAuthError::InvalidMlDsa44Proof)
+                | Err(NativeAuthError::VerificationFailure { index: 0 })
+        ));
+
+        let mut fn_rng = rand::thread_rng();
+        let mut fn_keygen = KeyPairGeneratorStandard::default();
+        let mut fn_signing_key = vec![0u8; fn_dsa::sign_key_size(FN_DSA_LOGN_512)];
+        let mut fn_verifier_key = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
+        fn_keygen.keygen(
+            FN_DSA_LOGN_512,
+            &mut fn_rng,
+            &mut fn_signing_key,
+            &mut fn_verifier_key,
+        );
+        let fn_signer = derive_signer_address(NativeAuthScheme::FnDsa512, &fn_verifier_key).unwrap();
+        assert_eq!(
+            validate_verifier_key(NativeAuthScheme::FnDsa512, &[1u8; 1]),
+            Err(NativeAuthError::InvalidFnDsa512VerifierKey)
+        );
+        assert!(matches!(
+            verify_entries(
+                &message,
+                &[fn_signer],
+                [NativeAuthEntryRef {
+                    scheme: NativeAuthScheme::FnDsa512,
+                    verifier_key: &fn_verifier_key,
+                    proof: &[2u8; 1],
+                }],
+            ),
+            Err(NativeAuthError::InvalidFnDsa512Proof)
+                | Err(NativeAuthError::VerificationFailure { index: 0 })
+        ));
+
+        let slh_keypair =
+            SlhSigningKey::<Shake128s>::slh_keygen_internal(&[4u8; 16], &[5u8; 16], &[6u8; 16]);
+        let slh_verifier_key = slh_keypair.verifying_key().to_bytes().as_slice().to_vec();
+        let slh_signer =
+            derive_signer_address(NativeAuthScheme::SlhDsaShake128s, &slh_verifier_key).unwrap();
+        assert_eq!(
+            validate_verifier_key(NativeAuthScheme::SlhDsaShake128s, &[1u8; 1]),
+            Err(NativeAuthError::InvalidSlhDsaShake128sVerifierKey)
+        );
+        assert!(matches!(
+            verify_entries(
+                &message,
+                &[slh_signer],
+                [NativeAuthEntryRef {
+                    scheme: NativeAuthScheme::SlhDsaShake128s,
+                    verifier_key: &slh_verifier_key,
+                    proof: &[2u8; 1],
+                }],
+            ),
+            Err(NativeAuthError::InvalidSlhDsaShake128sProof)
+                | Err(NativeAuthError::VerificationFailure { index: 0 })
+        ));
+    }
 }

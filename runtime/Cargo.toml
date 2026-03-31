@@ -190,6 +190,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+agave-native-auth = { workspace = true }
 agave-logger = { workspace = true }
 agave-transaction-view = { workspace = true }
 ed25519-dalek = { workspace = true }

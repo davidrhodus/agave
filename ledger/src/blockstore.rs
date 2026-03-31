@@ -5452,6 +5452,10 @@ pub fn make_chaining_slot_entries(
 pub mod tests {
     use {
         super::*,
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+            TransactionIdentifier,
+        },
         crate::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule},
@@ -5463,10 +5467,12 @@ pub mod tests {
         rand::{seq::SliceRandom, thread_rng},
         solana_account_decoder::parse_token::UiTokenAmount,
         solana_clock::{DEFAULT_MS_PER_SLOT, DEFAULT_TICKS_PER_SLOT},
-        solana_entry::entry::{next_entry, next_entry_mut},
+        solana_entry::entry::{next_entry, next_entry_mut, next_versioned_entry},
         solana_genesis_utils::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
         solana_hash::Hash,
-        solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses},
+        solana_message::{
+            compiled_instruction::CompiledInstruction, v0, v0::LoadedAddresses, VersionedMessage,
+        },
         solana_packet::PACKET_DATA_SIZE,
         solana_pubkey::Pubkey,
         solana_runtime::bank::{Bank, RewardType},
@@ -5474,7 +5480,7 @@ pub mod tests {
         solana_shred_version::version_from_hash,
         solana_signature::Signature,
         solana_storage_proto::convert::generated,
-        solana_transaction::Transaction,
+        solana_transaction::{versioned::VersionedTransaction, Transaction},
         solana_transaction_context::TransactionReturnData,
         solana_transaction_error::TransactionError,
         solana_transaction_status::{
@@ -5513,6 +5519,32 @@ pub mod tests {
         assert_eq!(slot, meta.slot);
         assert!(meta.is_full());
         assert!(meta.next_slots.is_empty());
+    }
+
+    pub(crate) fn create_test_v1_transaction(
+        signer: &Keypair,
+        recent_blockhash: Hash,
+    ) -> VersionedTransaction {
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&signer.pubkey(), &[], &[], recent_blockhash).unwrap(),
+        );
+        let verifier_key = signer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: signer.sign_message(txid.as_ref()).as_ref().to_vec(),
+            }],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -8512,6 +8544,50 @@ pub mod tests {
         assert_eq!(return_data.unwrap(), test_return_data);
         assert_eq!(compute_units_consumed, compute_units_consumed_2);
         assert_eq!(cost_units, cost_units_2);
+    }
+
+    #[test]
+    fn test_rooted_transaction_status_by_txid_persists_across_reopen() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let signer = Keypair::new();
+        let recent_blockhash = Hash::new_unique();
+        let transaction = create_test_v1_transaction(&signer, recent_blockhash);
+        let txid = transaction.transaction_id();
+        let compatibility_signature = transaction.signatures[0];
+        let slot = 0;
+
+        {
+            let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+            let entry = next_versioned_entry(&recent_blockhash, 1, vec![transaction.clone()]);
+            let shreds = entries_to_test_shreds(&[entry], slot, slot, true, 0);
+            blockstore.insert_shreds(shreds, None, false).unwrap();
+            blockstore.set_roots(std::iter::once(&slot)).unwrap();
+            blockstore
+                .write_transaction_status_with_id(
+                    slot,
+                    compatibility_signature,
+                    txid,
+                    std::iter::empty(),
+                    TransactionStatusMeta::default(),
+                    0,
+                )
+                .unwrap();
+
+            let status = blockstore
+                .get_rooted_transaction_status_by_identifier(&TransactionIdentifier::Txid(txid))
+                .unwrap();
+            assert_eq!(status.map(|(status_slot, _)| status_slot), Some(slot));
+            assert!(blockstore
+                .get_complete_transaction_by_identifier(TransactionIdentifier::Txid(txid), slot)
+                .unwrap()
+                .is_some());
+        }
+
+        let reopened = Blockstore::open(ledger_path.path()).unwrap();
+        let status = reopened
+            .get_rooted_transaction_status_by_identifier(&TransactionIdentifier::Txid(txid))
+            .unwrap();
+        assert_eq!(status.map(|(status_slot, _)| status_slot), Some(slot));
     }
 
     #[test]

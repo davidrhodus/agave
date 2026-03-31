@@ -7,6 +7,7 @@ use {
     bincode::Options as BincodeOptions,
     serde::{de::DeserializeOwned, Serialize},
     solana_clock::{Slot, UnixTimestamp},
+    solana_hash::{Hash, HASH_BYTES},
     solana_pubkey::{Pubkey, PUBKEY_BYTES},
     solana_signature::{Signature, SIGNATURE_BYTES},
     solana_storage_proto::convert::generated,
@@ -25,7 +26,7 @@ pub mod columns {
     // This avoids relatively obvious `super::` qualifications required for all non-trivial type
     // references in the column doc-comments.
     #[cfg(doc)]
-    use super::{blockstore_meta, generated, Pubkey, Signature, Slot, SlotColumn, UnixTimestamp};
+    use super::{blockstore_meta, generated, Hash, Pubkey, Signature, Slot, SlotColumn, UnixTimestamp};
 
     #[derive(Debug)]
     /// The slot metadata column.
@@ -139,6 +140,16 @@ pub mod columns {
     /// * index type: `(`[`Signature`]`, `[`Slot`])`
     /// * value type: [`generated::TransactionStatusMeta`]
     pub struct TransactionStatus;
+
+    #[derive(Debug)]
+    /// The canonical transaction identifier column.
+    ///
+    /// This column stores v1 native-auth txid lookups without relying on
+    /// compatibility signatures.
+    ///
+    /// * index type: `(`[`Hash`]`, `[`Slot`])`
+    /// * value type: [`Signature`]
+    pub struct TransactionIds;
 
     #[derive(Debug)]
     /// The address signatures column
@@ -371,6 +382,10 @@ impl ProtobufColumn for columns::TransactionStatus {
     type Type = generated::TransactionStatusMeta;
 }
 
+impl TypedColumn for columns::TransactionIds {
+    type Type = Signature;
+}
+
 impl ColumnIndexDeprecation for columns::TransactionStatus {
     const CURRENT_INDEX_LEN: usize = 72;
     type DeprecatedIndex = (u64, Signature, Slot);
@@ -444,6 +459,39 @@ impl Column for columns::AddressSignatures {
 }
 impl ColumnName for columns::AddressSignatures {
     const NAME: &'static str = "address_signatures";
+}
+
+impl Column for columns::TransactionIds {
+    type Index = (Hash, Slot);
+    type Key = [u8; HASH_BYTES + std::mem::size_of::<Slot>()];
+
+    #[inline]
+    fn key((txid, slot): &Self::Index) -> Self::Key {
+        convert_column_index_to_key_bytes!(Key,
+            ..32 => txid.as_ref(),
+            32.. => &slot.to_be_bytes(),
+        )
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        convert_column_key_bytes_to_index!(key,
+             0..32 => Hash::new_from_array,
+            32..40 => Slot::from_be_bytes,
+        )
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.1
+    }
+
+    // The TransactionIds column is not keyed by slot so this method is meaningless
+    // See Column::as_index() declaration for more details
+    fn as_index(_index: u64) -> Self::Index {
+        (Hash::default(), 0)
+    }
+}
+impl ColumnName for columns::TransactionIds {
+    const NAME: &'static str = "transaction_ids";
 }
 
 impl ColumnIndexDeprecation for columns::AddressSignatures {

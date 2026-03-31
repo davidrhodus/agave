@@ -1,0 +1,38 @@
+[package]
+name = "agave-native-auth"
+description = "Agave native transaction authentication primitives"
+documentation = "https://docs.rs/agave-native-auth"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+fn-dsa = { workspace = true }
+ml-dsa = { workspace = true }
+serde = { workspace = true, optional = true }
+signature = { workspace = true }
+slh-dsa = { workspace = true }
+solana-hash = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-sha256-hasher = { workspace = true }
+solana-short-vec = { workspace = true, optional = true }
+solana-signature = { workspace = true, features = ["verify"] }
+thiserror = { workspace = true }
+
+[features]
+agave-unstable-api = []
+default = ["serde"]
+serde = ["dep:serde", "dep:solana-short-vec", "solana-hash/serde", "solana-pubkey/serde", "solana-signature/serde"]
+
+[dev-dependencies]
+bincode = { workspace = true }
+rand = { workspace = true }
+solana-keypair = { workspace = true }
+solana-message = { workspace = true, features = ["bincode"] }
+solana-signer = { workspace = true }
+
+[lints]
+workspace = true

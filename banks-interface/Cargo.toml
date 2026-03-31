@@ -20,6 +20,7 @@ name = "solana_banks_interface"
 agave-unstable-api = []
 
 [dependencies]
+agave-native-auth = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 solana-account = { workspace = true, features = [ "serde" ] }
 solana-clock = { workspace = true }

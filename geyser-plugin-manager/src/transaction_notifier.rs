@@ -1,6 +1,7 @@
 /// Module responsible for notifying plugins of transactions
 use {
     crate::geyser_plugin_manager::GeyserPluginManager,
+    agave_native_auth::TransactionIdentifier,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions,
     },
@@ -30,6 +31,7 @@ impl TransactionNotifier for TransactionNotifierImpl {
         slot: Slot,
         index: usize,
         signature: &Signature,
+        _transaction_id: &TransactionIdentifier,
         message_hash: &Hash,
         is_vote: bool,
         transaction_status_meta: &TransactionStatusMeta,

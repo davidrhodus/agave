@@ -1,6 +1,6 @@
 use {
     super::{Bank, BankStatusCache},
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_feature_set::{enable_transaction_v1_native_auth, raise_cpi_nesting_limit_to_8, FeatureSet},
     solana_accounts_db::blockhash_queue::BlockhashQueue,
     solana_clock::{
         MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, MAX_TRANSACTION_FORWARDING_DELAY_GPU,
@@ -89,14 +89,20 @@ impl Bank {
             .zip(lock_results)
             .map(|(tx, lock_res)| match lock_res {
                 Ok(()) => {
+                    let tx = tx.borrow();
+                    if tx.is_v1_transaction()
+                        && !feature_set.is_active(&enable_transaction_v1_native_auth::id())
+                    {
+                        return Err(TransactionError::SanitizeFailure);
+                    }
+
                     let compute_budget_and_limits = tx
-                        .borrow()
                         .compute_budget_instruction_details()
                         .sanitize_and_convert_to_compute_budget_limits(feature_set)
                         .map(|limit| {
                             let fee_budget = FeeBudgetLimits::from(limit);
                             let fee_details = calculate_fee_details(
-                                tx.borrow(),
+                                tx,
                                 false,
                                 self.fee_structure.lamports_per_signature,
                                 fee_budget.prioritization_fee,
@@ -122,7 +128,7 @@ impl Bank {
                             error_counters.invalid_compute_budget += 1;
                         })?;
                     self.check_transaction_age(
-                        tx.borrow(),
+                        tx,
                         max_age,
                         &next_durable_nonce,
                         &hash_queue,

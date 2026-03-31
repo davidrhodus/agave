@@ -23,6 +23,7 @@ use {
         slot_stats::{ShredSource, SlotsStats},
         transaction_address_lookup_table_scanner::scan_transaction,
     },
+    agave_native_auth::TransactionIdentifier,
     agave_feature_set::FeatureSet,
     agave_snapshots::unpack_genesis_archive,
     assert_matches::debug_assert_matches,
@@ -266,6 +267,7 @@ pub struct Blockstore {
     rewards_cf: LedgerColumn<cf::Rewards>,
     roots_cf: LedgerColumn<cf::Root>,
     transaction_memos_cf: LedgerColumn<cf::TransactionMemos>,
+    transaction_ids_cf: LedgerColumn<cf::TransactionIds>,
     transaction_status_cf: LedgerColumn<cf::TransactionStatus>,
     transaction_status_index_cf: LedgerColumn<cf::TransactionStatusIndex>,
 
@@ -410,6 +412,7 @@ impl Blockstore {
         let rewards_cf = db.column();
         let roots_cf = db.column();
         let transaction_memos_cf = db.column();
+        let transaction_ids_cf = db.column();
         let transaction_status_cf = db.column();
         let transaction_status_index_cf = db.column();
 
@@ -444,6 +447,7 @@ impl Blockstore {
             rewards_cf,
             roots_cf,
             transaction_memos_cf,
+            transaction_ids_cf,
             transaction_status_cf,
             transaction_status_index_cf,
             highest_primary_index_slot: RwLock::<Option<Slot>>::default(),
@@ -853,6 +857,7 @@ impl Blockstore {
         self.data_shred_cf.submit_rocksdb_cf_metrics();
         self.code_shred_cf.submit_rocksdb_cf_metrics();
         self.transaction_status_cf.submit_rocksdb_cf_metrics();
+        self.transaction_ids_cf.submit_rocksdb_cf_metrics();
         self.address_signatures_cf.submit_rocksdb_cf_metrics();
         self.transaction_memos_cf.submit_rocksdb_cf_metrics();
         self.transaction_status_index_cf.submit_rocksdb_cf_metrics();
@@ -2953,10 +2958,12 @@ impl Blockstore {
         &self,
         slot: Slot,
         signature: Signature,
+        transaction_id: Option<Hash>,
         keys_with_writable: impl Iterator<Item = (&'a Pubkey, bool)>,
         status: TransactionStatusMeta,
         transaction_index: usize,
         mut write_fn: F,
+        mut write_transaction_id_fn: impl FnMut(Hash, Slot, Signature) -> Result<()>,
     ) -> Result<()>
     where
         F: FnMut(&Pubkey, Slot, u32, Signature, bool) -> Result<()>,
@@ -2966,6 +2973,9 @@ impl Blockstore {
             .map_err(|_| BlockstoreError::TransactionIndexOverflow)?;
         self.transaction_status_cf
             .put_protobuf((signature, slot), &status)?;
+        if let Some(transaction_id) = transaction_id {
+            write_transaction_id_fn(transaction_id, slot, signature)?;
+        }
 
         for (address, writeable) in keys_with_writable {
             write_fn(address, slot, transaction_index, signature, writeable)?;
@@ -2985,6 +2995,7 @@ impl Blockstore {
         self.write_transaction_status_helper(
             slot,
             signature,
+            None,
             keys_with_writable,
             status,
             transaction_index,
@@ -2993,6 +3004,36 @@ impl Blockstore {
                     (*address, slot, tx_index, signature),
                     &AddressSignatureMeta { writeable },
                 )
+            },
+            |_transaction_id, _slot, _signature| Ok(()),
+        )
+    }
+
+    pub fn write_transaction_status_with_id<'a>(
+        &self,
+        slot: Slot,
+        signature: Signature,
+        transaction_id: Hash,
+        keys_with_writable: impl Iterator<Item = (&'a Pubkey, bool)>,
+        status: TransactionStatusMeta,
+        transaction_index: usize,
+    ) -> Result<()> {
+        self.write_transaction_status_helper(
+            slot,
+            signature,
+            Some(transaction_id),
+            keys_with_writable,
+            status,
+            transaction_index,
+            |address, slot, tx_index, signature, writeable| {
+                self.address_signatures_cf.put(
+                    (*address, slot, tx_index, signature),
+                    &AddressSignatureMeta { writeable },
+                )
+            },
+            |transaction_id, slot, signature| {
+                self.transaction_ids_cf
+                    .put((transaction_id, slot), &signature)
             },
         )
     }
@@ -3009,6 +3050,7 @@ impl Blockstore {
         self.write_transaction_status_helper(
             slot,
             signature,
+            None,
             keys_with_writable,
             status,
             transaction_index,
@@ -3019,7 +3061,37 @@ impl Blockstore {
                     &AddressSignatureMeta { writeable },
                 )
             },
+            |_transaction_id, _slot, _signature| Ok(()),
         )
+    }
+
+    pub fn add_transaction_status_to_batch_with_id<'a>(
+        &self,
+        slot: Slot,
+        signature: Signature,
+        transaction_id: Hash,
+        keys_with_writable: impl Iterator<Item = (&'a Pubkey, bool)>,
+        status: TransactionStatusMeta,
+        transaction_index: usize,
+        db_write_batch: &mut WriteBatch,
+    ) -> Result<()> {
+        let status = status.into();
+        let transaction_index = u32::try_from(transaction_index)
+            .map_err(|_| BlockstoreError::TransactionIndexOverflow)?;
+        self.transaction_status_cf
+            .put_protobuf_in_batch(db_write_batch, (signature, slot), &status)?;
+        self.transaction_ids_cf
+            .put_in_batch(db_write_batch, (transaction_id, slot), &signature)?;
+
+        for (address, writeable) in keys_with_writable {
+            self.address_signatures_cf.put_in_batch(
+                db_write_batch,
+                (*address, slot, transaction_index, signature),
+                &AddressSignatureMeta { writeable },
+            )?;
+        }
+
+        Ok(())
     }
 
     pub fn read_transaction_memos(
@@ -3175,6 +3247,13 @@ impl Blockstore {
         self.get_transaction_status(signature, &HashSet::default())
     }
 
+    pub fn get_rooted_transaction_status_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+    ) -> Result<Option<(Slot, TransactionStatusMeta)>> {
+        self.get_transaction_status_by_identifier(identifier, &HashSet::default())
+    }
+
     /// Returns a transaction status
     pub fn get_transaction_status(
         &self,
@@ -3185,12 +3264,37 @@ impl Blockstore {
             .map(|(status, _)| status)
     }
 
+    pub fn get_transaction_status_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+        confirmed_unrooted_slots: &HashSet<Slot>,
+    ) -> Result<Option<(Slot, TransactionStatusMeta)>> {
+        match identifier {
+            TransactionIdentifier::Signature(signature) => {
+                self.get_transaction_status(*signature, confirmed_unrooted_slots)
+            }
+            TransactionIdentifier::Txid(txid) => self
+                .find_transaction_signature_by_id(*txid, confirmed_unrooted_slots)?
+                .map_or(Ok(None), |(slot, signature)| {
+                    self.read_transaction_status((signature, slot))
+                        .map(|status| status.map(|status| (slot, status)))
+                }),
+        }
+    }
+
     /// Returns a complete transaction if it was processed in a root
     pub fn get_rooted_transaction(
         &self,
         signature: Signature,
     ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
         self.get_transaction_with_status(signature, &HashSet::default())
+    }
+
+    pub fn get_rooted_transaction_by_identifier(
+        &self,
+        identifier: TransactionIdentifier,
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        self.get_transaction_with_status_by_identifier(&identifier, &HashSet::default())
     }
 
     /// Returns a complete transaction
@@ -3205,6 +3309,19 @@ impl Blockstore {
                 .take_while(|&slot| slot > max_root)
                 .collect();
         self.get_transaction_with_status(signature, &confirmed_unrooted_slots)
+    }
+
+    pub fn get_complete_transaction_by_identifier(
+        &self,
+        identifier: TransactionIdentifier,
+        highest_confirmed_slot: Slot,
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        let max_root = self.max_root();
+        let confirmed_unrooted_slots: HashSet<_> =
+            AncestorIterator::new_inclusive(highest_confirmed_slot, self)
+                .take_while(|&slot| slot > max_root)
+                .collect();
+        self.get_transaction_with_status_by_identifier(&identifier, &confirmed_unrooted_slots)
     }
 
     fn get_transaction_with_status(
@@ -3230,6 +3347,78 @@ impl Blockstore {
         } else {
             Ok(None)
         }
+    }
+
+    fn get_transaction_with_status_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+        confirmed_unrooted_slots: &HashSet<Slot>,
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        match identifier {
+            TransactionIdentifier::Signature(signature) => {
+                self.get_transaction_with_status(*signature, confirmed_unrooted_slots)
+            }
+            TransactionIdentifier::Txid(txid) => self
+                .find_transaction_signature_by_id(*txid, confirmed_unrooted_slots)?
+                .map_or(Ok(None), |(slot, signature)| {
+                    let meta = self
+                        .read_transaction_status((signature, slot))?
+                        .ok_or(BlockstoreError::TransactionStatusSlotMismatch)?;
+                    let transaction = self
+                        .find_transaction_in_slot(slot, signature)?
+                        .ok_or(BlockstoreError::TransactionStatusSlotMismatch)?;
+                    let block_time = self.get_block_time(slot)?;
+                    Ok(Some(ConfirmedTransactionWithStatusMeta {
+                        slot,
+                        tx_with_meta: TransactionWithStatusMeta::Complete(
+                            VersionedTransactionWithStatusMeta { transaction, meta },
+                        ),
+                        block_time,
+                    }))
+                }),
+        }
+    }
+
+    fn find_transaction_signature_by_id(
+        &self,
+        transaction_id: Hash,
+        confirmed_unrooted_slots: &HashSet<Slot>,
+    ) -> Result<Option<(Slot, Signature)>> {
+        let (lock, _) = self.ensure_lowest_cleanup_slot();
+        let first_available_block = self.get_first_available_block()?;
+        let iterator = self.transaction_ids_cf.iter(IteratorMode::From(
+            (transaction_id, first_available_block),
+            IteratorDirection::Forward,
+        ))?;
+
+        for ((txid, slot), _value) in iterator {
+            if txid != transaction_id {
+                break;
+            }
+            if !self.is_root(slot) && !confirmed_unrooted_slots.contains(&slot) {
+                continue;
+            }
+            let signature = self
+                .transaction_ids_cf
+                .get((transaction_id, slot))?
+                .ok_or(BlockstoreError::TransactionStatusSlotMismatch)?;
+            drop(lock);
+            return Ok(Some((slot, signature)));
+        }
+
+        drop(lock);
+        Ok(None)
+    }
+
+    fn read_transaction_identifier(
+        &self,
+        signature: Signature,
+        slot: Slot,
+    ) -> Result<String> {
+        Ok(self
+            .find_transaction_in_slot(slot, signature)?
+            .map(|transaction| transaction.transaction_identifier().to_string())
+            .unwrap_or_else(|| signature.to_string()))
     }
 
     fn find_transaction_in_slot(
@@ -3456,8 +3645,10 @@ impl Blockstore {
             let err = transaction_status.and_then(|(_slot, status)| status.status.err());
             let memo = self.read_transaction_memos(signature, slot)?;
             let block_time = self.get_block_time(slot)?;
+            let transaction_id = self.read_transaction_identifier(signature, slot)?;
             infos.push(ConfirmedTransactionStatusWithSignature {
                 signature,
+                transaction_id,
                 slot,
                 err,
                 memo,

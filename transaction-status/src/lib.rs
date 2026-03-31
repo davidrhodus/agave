@@ -19,10 +19,10 @@ pub use {
         TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionDetails,
         TransactionStatus, TransactionStatusMeta, TransactionTokenBalance, UiAccountsList,
         UiAddressTableLookup, UiCompiledInstruction, UiConfirmedBlock, UiInnerInstructions,
-        UiInstruction, UiLoadedAddresses, UiMessage, UiParsedInstruction, UiParsedMessage,
-        UiPartiallyDecodedInstruction, UiRawMessage, UiReturnDataEncoding, UiTransaction,
-        UiTransactionEncoding, UiTransactionReturnData, UiTransactionStatusMeta,
-        UiTransactionTokenBalance,
+        UiInstruction, UiLoadedAddresses, UiMessage, UiNativeAuthEntry, UiNativeAuthScheme,
+        UiParsedInstruction, UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
+        UiReturnDataEncoding, UiTransaction, UiTransactionEncoding, UiTransactionReturnData,
+        UiTransactionStatusMeta, UiTransactionTokenBalance,
     },
 };
 use {
@@ -91,6 +91,22 @@ pub trait EncodableWithMeta {
 trait JsonAccounts {
     type Encoded;
     fn build_json_accounts(&self) -> Self::Encoded;
+}
+
+fn canonical_transaction_id(transaction: &VersionedTransaction) -> String {
+    transaction.transaction_identifier().to_string()
+}
+
+fn native_auth_entries(
+    transaction: &VersionedTransaction,
+) -> Option<Vec<UiNativeAuthEntry>> {
+    (!transaction.native_auth_entries().is_empty()).then(|| {
+        transaction
+            .native_auth_entries()
+            .iter()
+            .map(Into::into)
+            .collect()
+    })
 }
 
 fn make_ui_partially_decoded_instruction(
@@ -334,7 +350,7 @@ impl ConfirmedBlock {
         encoding: UiTransactionEncoding,
         options: BlockEncodingOptions,
     ) -> Result<UiConfirmedBlock, EncodeError> {
-        let (transactions, signatures) = match options.transaction_details {
+        let (transactions, signatures, transaction_ids) = match options.transaction_details {
             TransactionDetails::Full => (
                 Some(
                     self.transactions
@@ -349,17 +365,22 @@ impl ConfirmedBlock {
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
                 None,
-            ),
-            TransactionDetails::Signatures => (
                 None,
-                Some(
-                    self.transactions
-                        .into_iter()
-                        .map(|tx_with_meta| tx_with_meta.transaction_signature().to_string())
-                        .collect(),
-                ),
             ),
-            TransactionDetails::None => (None, None),
+            TransactionDetails::Signatures => {
+                let (signatures, transaction_ids): (Vec<_>, Vec<_>) = self
+                    .transactions
+                    .into_iter()
+                    .map(|tx_with_meta| {
+                        (
+                            tx_with_meta.transaction_signature().to_string(),
+                            tx_with_meta.transaction_id(),
+                        )
+                    })
+                    .unzip();
+                (None, Some(signatures), Some(transaction_ids))
+            }
+            TransactionDetails::None => (None, None, None),
             TransactionDetails::Accounts => (
                 Some(
                     self.transactions
@@ -373,6 +394,7 @@ impl ConfirmedBlock {
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
                 None,
+                None,
             ),
         };
         Ok(UiConfirmedBlock {
@@ -381,6 +403,7 @@ impl ConfirmedBlock {
             parent_slot: self.parent_slot,
             transactions,
             signatures,
+            transaction_ids,
             rewards: if options.show_rewards {
                 Some(self.rewards)
             } else {
@@ -449,6 +472,15 @@ impl TransactionWithStatusMeta {
         }
     }
 
+    pub fn transaction_id(&self) -> String {
+        match self {
+            Self::MissingMetadata(transaction) => transaction.signatures[0].to_string(),
+            Self::Complete(VersionedTransactionWithStatusMeta { transaction, .. }) => {
+                canonical_transaction_id(transaction)
+            }
+        }
+    }
+
     pub fn encode(
         self,
         encoding: UiTransactionEncoding,
@@ -460,6 +492,8 @@ impl TransactionWithStatusMeta {
                 version: None,
                 transaction: transaction.encode(encoding),
                 meta: None,
+                transaction_id: Some(transaction.signatures[0].to_string()),
+                native_auth_entries: None,
             }),
             Self::Complete(tx_with_meta) => {
                 tx_with_meta.encode(encoding, max_supported_transaction_version, show_rewards)
@@ -484,6 +518,8 @@ impl TransactionWithStatusMeta {
                 version: None,
                 transaction: transaction.build_json_accounts(),
                 meta: None,
+                transaction_id: Some(transaction.signatures[0].to_string()),
+                native_auth_entries: None,
             }),
             Self::Complete(tx_with_meta) => {
                 tx_with_meta.build_json_accounts(max_supported_transaction_version, show_rewards)
@@ -542,6 +578,8 @@ impl VersionedTransactionWithStatusMeta {
                 }
             }),
             version,
+            transaction_id: Some(canonical_transaction_id(&self.transaction)),
+            native_auth_entries: native_auth_entries(&self.transaction),
         })
     }
 
@@ -587,6 +625,8 @@ impl VersionedTransactionWithStatusMeta {
                 show_rewards,
             )),
             version,
+            transaction_id: Some(canonical_transaction_id(&self.transaction)),
+            native_auth_entries: native_auth_entries(&self.transaction),
         })
     }
 }
@@ -880,6 +920,8 @@ impl EncodableWithMeta for v0::Message {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionByAddrInfo {
     pub signature: Signature,          // The transaction signature
+    #[serde(default)]
+    pub transaction_id: String,        // Canonical transaction identifier
     pub err: Option<TransactionError>, // None if the transaction executed successfully
     pub index: u32,                    // Where the transaction is located in the block
     pub memo: Option<String>,          // Transaction memo

@@ -1,53 +1,15 @@
 use {
     crate::{
         bytes::{
-            advance_offset_for_array, advance_offset_for_type, check_remaining,
-            optimized_read_compressed_u16, read_byte, read_slice_data, read_type,
+            advance_offset_for_array, advance_offset_for_type, read_compressed_u16,
+            read_slice_data, read_type,
         },
         result::{Result, TransactionViewError},
     },
     core::fmt::{Debug, Formatter},
-    solana_hash::Hash,
-    solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
-    solana_signature::Signature,
     solana_svm_transaction::message_address_table_lookup::SVMMessageAddressTableLookup,
 };
-
-// Each ATL has at least a Pubkey, one byte for the number of write indexes,
-// and one byte for the number of read indexes. Additionally, for validity
-// the ATL must have at least one write or read index giving a minimum size
-// of 35 bytes.
-const MIN_SIZED_ATL: usize = {
-    core::mem::size_of::<Pubkey>() // account key
-            + 1 // writable indexes length
-            + 1 // readonly indexes length
-            + 1 // single account (either write or read)
-};
-
-// A valid packet with ATLs has:
-// 1. At least 1 signature
-// 2. 1 message prefix byte
-// 3. 3 bytes for the message header
-// 4. 1 static account key
-// 5. 1 recent blockhash
-// 6. 1 byte for the number of instructions (0)
-// 7. 1 byte for the number of ATLS
-const MIN_SIZED_PACKET_WITH_ATLS: usize = {
-    1 // signatures count
-    + core::mem::size_of::<Signature>() // signature
-    + 1 // message prefix
-    + 3 // message header
-    + 1 // static account keys count
-    + core::mem::size_of::<Pubkey>() // static account key
-    + core::mem::size_of::<Hash>() // recent blockhash
-    + 1 // number of instructions
-    + 1 // number of ATLS
-};
-
-/// The maximum number of ATLS that can fit in a valid packet.
-const MAX_ATLS_PER_PACKET: u8 =
-    ((PACKET_DATA_SIZE - MIN_SIZED_PACKET_WITH_ATLS) / MIN_SIZED_ATL) as u8;
 
 /// Contains metadata about the address table lookups in a transaction packet.
 #[derive(Debug)]
@@ -55,7 +17,7 @@ pub(crate) struct AddressTableLookupFrame {
     /// The number of address table lookups in the transaction.
     pub(crate) num_address_table_lookups: u8,
     /// The offset to the first address table lookup in the transaction.
-    pub(crate) offset: u16,
+    pub(crate) offset: usize,
     /// The total number of writable lookup accounts in the transaction.
     pub(crate) total_writable_lookup_accounts: u16,
     /// The total number of readonly lookup accounts in the transaction.
@@ -70,36 +32,21 @@ impl AddressTableLookupFrame {
     /// but will not cache data related to these ATLs.
     #[inline(always)]
     pub(crate) fn try_new(bytes: &[u8], offset: &mut usize) -> Result<Self> {
-        // Maximum number of ATLs should be represented by a single byte,
-        // thus the MSB should not be set.
-        const _: () = assert!(MAX_ATLS_PER_PACKET & 0b1000_0000 == 0);
-        let num_address_table_lookups = read_byte(bytes, offset)?;
-        if num_address_table_lookups > MAX_ATLS_PER_PACKET {
+        let num_address_table_lookups = read_compressed_u16(bytes, offset)?;
+        if num_address_table_lookups > u16::from(u8::MAX) {
             return Err(TransactionViewError::ParseError);
         }
-
-        // Check that the remaining bytes are enough to hold the ATLs.
-        check_remaining(
-            bytes,
-            *offset,
-            MIN_SIZED_ATL.wrapping_mul(usize::from(num_address_table_lookups)),
-        )?;
-
-        // We know the offset does not exceed packet length, and our packet
-        // length is less than u16::MAX, so we can safely cast to u16.
-        let address_table_lookups_offset = *offset as u16;
+        let address_table_lookups_offset = *offset;
 
         // Check that there is no chance of overflow when calculating the total
         // number of writable and readonly lookup accounts using a u32.
-        const _: () =
-            assert!(u16::MAX as usize * MAX_ATLS_PER_PACKET as usize <= u32::MAX as usize);
         let mut total_writable_lookup_accounts: u32 = 0;
         let mut total_readonly_lookup_accounts: u32 = 0;
 
         // The ATLs do not have a fixed size. So we must iterate over
         // each ATL to find the total size of the ATLs in the packet,
         // and check for any malformed ATLs or buffer overflows.
-        for _index in 0..num_address_table_lookups {
+        for _index in 0..(num_address_table_lookups as u8) {
             // Each ATL has 3 pieces:
             // 1. Address (Pubkey)
             // 2. write indexes ([u8])
@@ -109,20 +56,20 @@ impl AddressTableLookupFrame {
             advance_offset_for_type::<Pubkey>(bytes, offset)?;
 
             // Read the number of write indexes, and then update the offset.
-            let num_write_accounts = optimized_read_compressed_u16(bytes, offset)?;
+            let num_write_accounts = read_compressed_u16(bytes, offset)?;
             total_writable_lookup_accounts =
                 total_writable_lookup_accounts.wrapping_add(u32::from(num_write_accounts));
             advance_offset_for_array::<u8>(bytes, offset, num_write_accounts)?;
 
             // Read the number of read indexes, and then update the offset.
-            let num_read_accounts = optimized_read_compressed_u16(bytes, offset)?;
+            let num_read_accounts = read_compressed_u16(bytes, offset)?;
             total_readonly_lookup_accounts =
                 total_readonly_lookup_accounts.wrapping_add(u32::from(num_read_accounts));
             advance_offset_for_array::<u8>(bytes, offset, num_read_accounts)?;
         }
 
         Ok(Self {
-            num_address_table_lookups,
+            num_address_table_lookups: num_address_table_lookups as u8,
             offset: address_table_lookups_offset,
             total_writable_lookup_accounts: u16::try_from(total_writable_lookup_accounts)
                 .map_err(|_| TransactionViewError::SanitizeError)?,
@@ -162,8 +109,7 @@ impl<'a> Iterator for AddressTableLookupIterator<'a> {
             let account_key = unsafe { read_type::<Pubkey>(self.bytes, &mut self.offset) }.ok()?;
 
             // Read the number of write indexes, and then update the offset.
-            let num_write_accounts =
-                optimized_read_compressed_u16(self.bytes, &mut self.offset).ok()?;
+            let num_write_accounts = read_compressed_u16(self.bytes, &mut self.offset).ok()?;
 
             const _: () = assert!(core::mem::align_of::<u8>() == 1, "u8 alignment");
             // SAFETY:
@@ -176,8 +122,7 @@ impl<'a> Iterator for AddressTableLookupIterator<'a> {
                     .ok()?;
 
             // Read the number of read indexes, and then update the offset.
-            let num_read_accounts =
-                optimized_read_compressed_u16(self.bytes, &mut self.offset).ok()?;
+            let num_read_accounts = read_compressed_u16(self.bytes, &mut self.offset).ok()?;
 
             const _: () = assert!(core::mem::align_of::<u8>() == 1, "u8 alignment");
             // SAFETY:

@@ -1,8 +1,6 @@
-// static account keys has max
-use {
-    agave_transaction_view::static_account_keys_frame::MAX_STATIC_ACCOUNTS_PER_PACKET as FILTER_SIZE,
-    solana_pubkey::Pubkey, solana_svm_transaction::instruction::SVMInstruction,
-};
+use {solana_pubkey::Pubkey, solana_svm_transaction::instruction::SVMInstruction};
+
+const FILTER_SIZE: usize = (u8::MAX as usize) + 1;
 
 pub struct PrecompileSignatureDetails {
     pub num_secp256k1_instruction_signatures: u64,
@@ -87,14 +85,14 @@ struct SignatureDetailsFilter {
     // array of slots for all possible static and sanitized program_id_index,
     // each slot indicates if a program_id_index has not been checked, or is
     // already checked with result that can be reused.
-    flags: [Option<ProgramIdStatus>; FILTER_SIZE as usize],
+    flags: [Option<ProgramIdStatus>; FILTER_SIZE],
 }
 
 impl SignatureDetailsFilter {
     #[inline]
     fn new() -> Self {
         Self {
-            flags: [None; FILTER_SIZE as usize],
+            flags: [None; FILTER_SIZE],
         }
     }
 

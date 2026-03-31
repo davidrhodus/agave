@@ -185,6 +185,7 @@ impl Rocks {
             new_cf_descriptor::<columns::ShredData>(options, oldest_slot),
             new_cf_descriptor::<columns::ShredCode>(options, oldest_slot),
             new_cf_descriptor::<columns::TransactionStatus>(options, oldest_slot),
+            new_cf_descriptor::<columns::TransactionIds>(options, oldest_slot),
             new_cf_descriptor::<columns::AddressSignatures>(options, oldest_slot),
             new_cf_descriptor::<columns::TransactionMemos>(options, oldest_slot),
             new_cf_descriptor::<columns::TransactionStatusIndex>(options, oldest_slot),
@@ -242,7 +243,7 @@ impl Rocks {
         cf_descriptors
     }
 
-    const fn columns() -> [&'static str; 20] {
+    const fn columns() -> [&'static str; 21] {
         [
             columns::ErasureMeta::NAME,
             columns::DeadSlots::NAME,
@@ -255,6 +256,7 @@ impl Rocks {
             columns::ShredData::NAME,
             columns::ShredCode::NAME,
             columns::TransactionStatus::NAME,
+            columns::TransactionIds::NAME,
             columns::AddressSignatures::NAME,
             columns::TransactionMemos::NAME,
             columns::TransactionStatusIndex::NAME,
@@ -970,6 +972,18 @@ where
 
         result
     }
+
+    pub fn put_protobuf_in_batch(
+        &self,
+        batch: &mut WriteBatch,
+        index: C::Index,
+        value: &C::Type,
+    ) -> Result<()> {
+        let mut buf = Vec::with_capacity(value.encoded_len());
+        value.encode(&mut buf)?;
+        let key = <C as Column>::key(&index);
+        batch.put_cf(self.handle(), key, &buf)
+    }
 }
 
 impl<C> LedgerColumn<C>
@@ -1233,6 +1247,7 @@ fn should_enable_cf_compaction(cf_name: &str) -> bool {
     matches!(
         cf_name,
         columns::TransactionStatus::NAME
+            | columns::TransactionIds::NAME
             | columns::TransactionMemos::NAME
             | columns::AddressSignatures::NAME
     )

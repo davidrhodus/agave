@@ -14,6 +14,7 @@ agave-unstable-api = []
 dev-context-only-utils = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
 solana-packet = { workspace = true }
@@ -26,6 +27,7 @@ solana-transaction-context = { workspace = true }
 
 [dev-dependencies]
 # See order-crates-for-publishing.py for using this unusual `path = "."`
+agave-native-auth = { workspace = true }
 agave-transaction-view = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
 bincode = { workspace = true }
 criterion = { workspace = true }

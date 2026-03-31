@@ -398,13 +398,18 @@ impl Blockstore {
             .iter(IteratorMode::Start)?
             .next()
             .is_none();
+        let transaction_ids_empty = self
+            .transaction_ids_cf
+            .iter(IteratorMode::Start)?
+            .next()
+            .is_none();
         let address_signatures_empty = self
             .address_signatures_cf
             .iter(IteratorMode::Start)?
             .next()
             .is_none();
 
-        Ok(transaction_status_empty && address_signatures_empty)
+        Ok(transaction_status_empty && transaction_ids_empty && address_signatures_empty)
     }
 
     /// Purges special columns (using a non-Slot primary-index) exactly, by
@@ -453,6 +458,10 @@ impl Blockstore {
                 if let Some(&signature) = transaction.signatures.first() {
                     self.transaction_status_cf
                         .delete_in_batch(batch, (signature, slot))?;
+                    if transaction.is_v1() {
+                        self.transaction_ids_cf
+                            .delete_in_batch(batch, (transaction.transaction_id(), slot))?;
+                    }
                     self.transaction_memos_cf
                         .delete_in_batch(batch, (signature, slot))?;
                     if !primary_indexes.is_empty() {

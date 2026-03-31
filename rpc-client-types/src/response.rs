@@ -271,9 +271,17 @@ pub enum RpcSignatureResult {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum RpcTransactionResult {
+    ProcessedTransaction(ProcessedTransactionResult),
+    ReceivedTransaction(ReceivedTransactionResult),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcLogsResponse {
     pub signature: String, // Signature as base58 string
+    pub transaction_id: String,
     pub err: Option<UiTransactionError>,
     pub logs: Vec<String>,
 }
@@ -288,6 +296,18 @@ pub struct ProcessedSignatureResult {
 #[serde(rename_all = "camelCase")]
 pub enum ReceivedSignatureResult {
     ReceivedSignature,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessedTransactionResult {
+    pub err: Option<UiTransactionError>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReceivedTransactionResult {
+    ReceivedTransaction,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -491,6 +511,7 @@ pub struct RpcTokenAccountBalance {
 #[serde(rename_all = "camelCase")]
 pub struct RpcConfirmedTransactionStatusWithSignature {
     pub signature: String,
+    pub transaction_id: String,
     pub slot: Slot,
     pub err: Option<UiTransactionError>,
     pub memo: Option<String>,
@@ -539,6 +560,7 @@ impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionSt
     fn from(value: ConfirmedTransactionStatusWithSignature) -> Self {
         let ConfirmedTransactionStatusWithSignature {
             signature,
+            transaction_id,
             slot,
             err,
             memo,
@@ -546,6 +568,7 @@ impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionSt
         } = value;
         Self {
             signature: signature.to_string(),
+            transaction_id,
             slot,
             err: err.map(Into::into),
             memo,

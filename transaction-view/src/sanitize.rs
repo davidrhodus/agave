@@ -145,6 +145,7 @@ mod tests {
                 recent_blockhash: Hash::default(),
                 instructions,
             }),
+            native_auth_entries: vec![],
         }
     }
 
@@ -164,6 +165,7 @@ mod tests {
                 instructions,
                 address_table_lookups,
             }),
+            native_auth_entries: vec![],
         }
     }
 
@@ -178,6 +180,7 @@ mod tests {
                 ],
                 Some(&payer),
             )),
+            native_auth_entries: vec![],
         }
     }
 

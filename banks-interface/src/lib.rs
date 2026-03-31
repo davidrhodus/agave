@@ -10,6 +10,7 @@
 #![allow(deprecated)]
 
 use {
+    agave_native_auth::TransactionIdentifier,
     serde::{Deserialize, Serialize},
     solana_account::Account,
     solana_clock::Slot,
@@ -77,6 +78,9 @@ pub trait Banks {
     async fn send_transaction_with_context(transaction: VersionedTransaction);
     async fn get_transaction_status_with_context(signature: Signature)
         -> Option<TransactionStatus>;
+    async fn get_transaction_status_with_context_by_id(
+        transaction_id: TransactionIdentifier,
+    ) -> Option<TransactionStatus>;
     async fn get_slot_with_context(commitment: CommitmentLevel) -> Slot;
     async fn get_block_height_with_context(commitment: CommitmentLevel) -> u64;
     async fn process_transaction_with_preflight_and_commitment_and_context(

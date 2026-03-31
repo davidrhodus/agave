@@ -1,4 +1,5 @@
 use {
+    agave_native_auth::{NativeAuthEntry, NativeAuthScheme},
     crate::{StoredExtendedRewards, StoredTransactionError, StoredTransactionStatusMeta},
     solana_account_decoder::parse_token::{real_number_string_trimmed, UiTokenAmount},
     solana_hash::{Hash, HASH_BYTES},
@@ -255,6 +256,7 @@ impl From<Transaction> for generated::Transaction {
                 .map(|signature| <Signature as AsRef<[u8]>>::as_ref(&signature).into())
                 .collect(),
             message: Some(value.message.into()),
+            native_auth_entries: vec![],
         }
     }
 }
@@ -268,6 +270,11 @@ impl From<VersionedTransaction> for generated::Transaction {
                 .map(|signature| <Signature as AsRef<[u8]>>::as_ref(&signature).into())
                 .collect(),
             message: Some(value.message.into()),
+            native_auth_entries: value
+                .native_auth_entries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -282,6 +289,33 @@ impl From<generated::Transaction> for VersionedTransaction {
                 .collect::<Result<_, _>>()
                 .unwrap(),
             message: value.message.expect("message is required").into(),
+            native_auth_entries: value
+                .native_auth_entries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<NativeAuthEntry> for generated::NativeAuthEntry {
+    fn from(value: NativeAuthEntry) -> Self {
+        Self {
+            scheme: u32::from(value.scheme as u8),
+            verifier_key: value.verifier_key,
+            proof: value.proof,
+        }
+    }
+}
+
+impl From<generated::NativeAuthEntry> for NativeAuthEntry {
+    fn from(value: generated::NativeAuthEntry) -> Self {
+        let scheme = NativeAuthScheme::try_from(value.scheme as u8)
+            .expect("invalid native auth scheme in stored transaction");
+        Self {
+            scheme,
+            verifier_key: value.verifier_key,
+            proof: value.proof,
         }
     }
 }
@@ -1199,6 +1233,7 @@ impl From<TransactionByAddrInfo> for tx_by_addr::TransactionByAddrInfo {
     fn from(by_addr: TransactionByAddrInfo) -> Self {
         let TransactionByAddrInfo {
             signature,
+            transaction_id,
             err,
             index,
             memo,
@@ -1211,6 +1246,7 @@ impl From<TransactionByAddrInfo> for tx_by_addr::TransactionByAddrInfo {
             index,
             memo: memo.map(|memo| tx_by_addr::Memo { memo }),
             block_time: block_time.map(|timestamp| tx_by_addr::UnixTimestamp { timestamp }),
+            transaction_id,
         }
     }
 }
@@ -1221,22 +1257,31 @@ impl TryFrom<tx_by_addr::TransactionByAddrInfo> for TransactionByAddrInfo {
     fn try_from(
         transaction_by_addr: tx_by_addr::TransactionByAddrInfo,
     ) -> Result<Self, Self::Error> {
-        let err = transaction_by_addr
-            .err
+        let tx_by_addr::TransactionByAddrInfo {
+            signature,
+            err,
+            index,
+            memo,
+            block_time,
+            transaction_id,
+        } = transaction_by_addr;
+
+        let err = err
             .map(|err| err.try_into())
             .transpose()?;
+        let signature = Signature::try_from(signature).map_err(|_| "Invalid Signature")?;
 
         Ok(Self {
-            signature: Signature::try_from(transaction_by_addr.signature)
-                .map_err(|_| "Invalid Signature")?,
+            signature,
+            transaction_id: if transaction_id.is_empty() {
+                signature.to_string()
+            } else {
+                transaction_id
+            },
             err,
-            index: transaction_by_addr.index,
-            memo: transaction_by_addr
-                .memo
-                .map(|tx_by_addr::Memo { memo }| memo),
-            block_time: transaction_by_addr
-                .block_time
-                .map(|tx_by_addr::UnixTimestamp { timestamp }| timestamp),
+            index,
+            memo: memo.map(|tx_by_addr::Memo { memo }| memo),
+            block_time: block_time.map(|tx_by_addr::UnixTimestamp { timestamp }| timestamp),
         })
     }
 }
@@ -1313,12 +1358,14 @@ mod test {
 
     #[test]
     fn test_transaction_by_addr_encode() {
+        let signature = bs58::decode("Nfo6rgemG1KLbk1xuNwfrQTsdxaGfLuWURHNRy9LYnDrubG7LFQZaA5obPNas9LQ6DdorJqxh2LxA3PsnWdkSrL")
+            .into_vec()
+            .map(Signature::try_from)
+            .unwrap()
+            .unwrap();
         let info = TransactionByAddrInfo {
-            signature: bs58::decode("Nfo6rgemG1KLbk1xuNwfrQTsdxaGfLuWURHNRy9LYnDrubG7LFQZaA5obPNas9LQ6DdorJqxh2LxA3PsnWdkSrL")
-                .into_vec()
-                .map(Signature::try_from)
-                .unwrap()
-                .unwrap(),
+            signature,
+            transaction_id: signature.to_string(),
             err: None,
             index: 5,
             memo: Some("string".to_string()),

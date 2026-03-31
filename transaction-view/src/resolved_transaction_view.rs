@@ -55,9 +55,11 @@ impl<D: TransactionData> ResolvedTransactionView<D> {
         // verify that the number of readable and writable match up.
         // This is a basic sanity check to make sure we're not passing a totally
         // invalid set of resolved addresses.
-        // Additionally if it is a v0 transaction it *must* have resolved
+        // Additionally if it is a v0/v1 transaction it *must* have resolved
         // addresses, even if they are empty.
-        if matches!(view.version(), TransactionVersion::V0) && resolved_addresses_ref.is_none() {
+        if matches!(view.version(), TransactionVersion::V0 | TransactionVersion::V1)
+            && resolved_addresses_ref.is_none()
+        {
             return Err(TransactionViewError::AddressLookupMismatch);
         }
         if let Some(loaded_addresses) = resolved_addresses_ref {
@@ -284,6 +286,7 @@ mod tests {
                 }],
                 recent_blockhash: Hash::default(),
             }),
+            native_auth_entries: vec![],
         };
         let bytes = bincode::serialize(&transaction).unwrap();
         let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
@@ -315,6 +318,7 @@ mod tests {
                 address_table_lookups: vec![],
                 recent_blockhash: Hash::default(),
             }),
+            native_auth_entries: vec![],
         };
         let bytes = bincode::serialize(&transaction).unwrap();
         let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
@@ -352,6 +356,7 @@ mod tests {
                 }],
                 recent_blockhash: Hash::default(),
             }),
+            native_auth_entries: vec![],
         };
         let bytes = bincode::serialize(&transaction).unwrap();
         let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
@@ -391,6 +396,7 @@ mod tests {
                             .collect(),
                     }],
                 }),
+                native_auth_entries: vec![],
             };
 
         let key0 = Pubkey::new_unique();
@@ -504,6 +510,7 @@ mod tests {
                     }],
                     recent_blockhash: Hash::default(),
                 }),
+                native_auth_entries: vec![],
             };
 
         // Demote writable program - static

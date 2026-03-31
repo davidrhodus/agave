@@ -9,9 +9,10 @@ use {
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
             LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
             SignatureSubscriptionParams, SubscriptionControl, SubscriptionId, SubscriptionParams,
-            SubscriptionToken,
+            SubscriptionToken, TransactionSubscriptionParams,
         },
     },
+    agave_native_auth::TransactionIdentifier,
     dashmap::DashMap,
     jsonrpc_core::{Error, ErrorCode, Result},
     jsonrpc_derive::rpc,
@@ -22,12 +23,14 @@ use {
     solana_rpc_client_api::{
         config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
-            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
-            RpcTransactionLogsFilter,
+            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+            RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+            RpcTransactionSubscribeConfig,
         },
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
-            RpcSignatureResult, RpcVersionInfo, RpcVote, SlotInfo, SlotUpdate,
+            RpcSignatureResult, RpcTransactionResult, RpcVersionInfo, RpcVote, SlotInfo,
+            SlotUpdate,
         },
     },
     solana_signature::Signature,
@@ -142,6 +145,19 @@ pub trait RpcSolPubSub {
         config: Option<RpcSignatureSubscribeConfig>,
     );
 
+    #[pubsub(
+        subscription = "transactionNotification",
+        subscribe,
+        name = "transactionSubscribe"
+    )]
+    fn transaction_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<RpcTransactionResult>>,
+        transaction_id_str: String,
+        config: Option<RpcTransactionSubscribeConfig>,
+    );
+
     // Unsubscribe from signature notification subscription.
     #[pubsub(
         subscription = "signatureNotification",
@@ -149,6 +165,17 @@ pub trait RpcSolPubSub {
         name = "signatureUnsubscribe"
     )]
     fn signature_unsubscribe(
+        &self,
+        meta: Option<Self::Metadata>,
+        id: PubSubSubscriptionId,
+    ) -> Result<bool>;
+
+    #[pubsub(
+        subscription = "transactionNotification",
+        unsubscribe,
+        name = "transactionUnsubscribe"
+    )]
+    fn transaction_unsubscribe(
         &self,
         meta: Option<Self::Metadata>,
         id: PubSubSubscriptionId,
@@ -304,9 +331,19 @@ mod internal {
             config: Option<RpcSignatureSubscribeConfig>,
         ) -> Result<SubscriptionId>;
 
+        #[rpc(name = "transactionSubscribe")]
+        fn transaction_subscribe(
+            &self,
+            transaction_id_str: String,
+            config: Option<RpcTransactionSubscribeConfig>,
+        ) -> Result<SubscriptionId>;
+
         // Unsubscribe from signature notification subscription.
         #[rpc(name = "signatureUnsubscribe")]
         fn signature_unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
+
+        #[rpc(name = "transactionUnsubscribe")]
+        fn transaction_unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
 
         // Get notification when slot is encountered
         #[rpc(name = "slotSubscribe")]
@@ -526,6 +563,24 @@ impl RpcSolPubSubInternal for RpcSolPubSubImpl {
         self.unsubscribe(id)
     }
 
+    fn transaction_subscribe(
+        &self,
+        transaction_id_str: String,
+        config: Option<RpcTransactionSubscribeConfig>,
+    ) -> Result<SubscriptionId> {
+        let config = config.unwrap_or_default();
+        let params = TransactionSubscriptionParams {
+            transaction_id: param::<TransactionIdentifier>(&transaction_id_str, "transactionId")?,
+            commitment: config.commitment.unwrap_or_default(),
+            enable_received_notification: config.enable_received_notification.unwrap_or_default(),
+        };
+        self.subscribe(SubscriptionParams::Transaction(params))
+    }
+
+    fn transaction_unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
+        self.unsubscribe(id)
+    }
+
     fn slot_subscribe(&self) -> Result<SubscriptionId> {
         self.subscribe(SubscriptionParams::Slot)
     }
@@ -618,6 +673,10 @@ mod tests {
             optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank, rpc_pubsub_service,
             rpc_subscriptions::RpcSubscriptions,
         },
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+            TransactionIdentifier,
+        },
         base64::{prelude::BASE64_STANDARD, Engine},
         jsonrpc_core::{IoHandler, Response},
         serial_test::serial,
@@ -627,11 +686,13 @@ mod tests {
         solana_commitment_config::CommitmentConfig,
         solana_hash::Hash,
         solana_keypair::Keypair,
-        solana_message::Message,
+        solana_message::{v0, Message, MessageHeader, VersionedMessage},
         solana_pubkey::Pubkey,
         solana_rent::Rent,
+        solana_rpc_client_api::config::RpcTransactionSubscribeConfig,
         solana_rpc_client_api::response::{
-            ProcessedSignatureResult, ReceivedSignatureResult, RpcSignatureResult, SlotInfo,
+            ProcessedSignatureResult, ProcessedTransactionResult, ReceivedSignatureResult,
+            ReceivedTransactionResult, RpcSignatureResult, RpcTransactionResult, SlotInfo,
         },
         solana_runtime::{
             bank::Bank,
@@ -644,8 +705,9 @@ mod tests {
         },
         solana_signer::Signer,
         solana_system_interface::{instruction as system_instruction, program as system_program},
+        solana_sysvar::slot_hashes::SlotHashes,
         solana_system_transaction as system_transaction,
-        solana_transaction::Transaction,
+        solana_transaction::{versioned::VersionedTransaction, Transaction},
         solana_vote::vote_transaction::VoteTransaction,
         solana_vote_interface::{
             instruction::{self as vote_instruction, CreateVoteAccountConfig},
@@ -683,6 +745,60 @@ mod tests {
         };
         subscriptions.notify_subscribers(commitment_slots);
         Ok(())
+    }
+
+    fn process_versioned_transaction_and_notify(
+        bank_forks: &RwLock<BankForks>,
+        tx: VersionedTransaction,
+        subscriptions: &RpcSubscriptions,
+        current_slot: Slot,
+    ) -> transaction::Result<()> {
+        bank_forks
+            .read()
+            .unwrap()
+            .get(current_slot)
+            .unwrap()
+            .process_transaction_with_metadata(tx)?;
+        let commitment_slots = CommitmentSlots {
+            slot: current_slot,
+            ..CommitmentSlots::default()
+        };
+        subscriptions.notify_subscribers(commitment_slots);
+        Ok(())
+    }
+
+    fn create_test_v1_transaction(payer: &Keypair, recent_blockhash: Hash) -> VersionedTransaction {
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            recent_blockhash,
+            account_keys: vec![payer.pubkey()],
+            address_table_lookups: vec![],
+            instructions: vec![],
+        });
+        let verifier_key = payer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let mut tx = VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: vec![],
+            }],
+        )
+        .unwrap();
+        tx.native_auth_entries[0].proof = payer.sign_message(txid.as_ref()).as_ref().to_vec();
+        assert_eq!(tx.verify_with_results(), vec![true]);
+        tx
     }
 
     #[test]
@@ -805,6 +921,96 @@ mod tests {
                    "value": expected_res,
                },
                "subscription": 2,
+           }
+        });
+        assert_eq!(
+            expected,
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_transaction_subscribe_v1() {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair: alice,
+            ..
+        } = create_genesis_config(10_000);
+        activate_all_features(&mut genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
+        bank.set_sysvar_for_tests(&SlotHashes::default());
+        let blockhash = bank.last_blockhash();
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
+        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
+            Arc::new(AtomicBool::new(false)),
+            max_complete_transaction_status_slot,
+            bank_forks.clone(),
+            Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
+        ));
+
+        let tx = create_test_v1_transaction(&alice, blockhash);
+        let txid = tx.transaction_id();
+
+        let (rpc, mut receiver) = rpc_pubsub_service::test_connection(&rpc_subscriptions);
+        rpc.transaction_subscribe(
+            txid.to_string(),
+            Some(RpcTransactionSubscribeConfig {
+                commitment: Some(CommitmentConfig::finalized()),
+                ..RpcTransactionSubscribeConfig::default()
+            }),
+        )
+        .unwrap();
+
+        process_versioned_transaction_and_notify(&bank_forks, tx.clone(), &rpc_subscriptions, 0)
+            .unwrap();
+
+        let response = receiver.recv();
+        let expected_res =
+            RpcTransactionResult::ProcessedTransaction(ProcessedTransactionResult { err: None });
+        let expected = json!({
+           "jsonrpc": "2.0",
+           "method": "transactionNotification",
+           "params": {
+               "result": {
+                   "context": { "slot": 0 },
+                   "value": expected_res,
+               },
+               "subscription": 0,
+           }
+        });
+        assert_eq!(
+            expected,
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+        );
+
+        let (rpc, mut receiver) = rpc_pubsub_service::test_connection(&rpc_subscriptions);
+        rpc.transaction_subscribe(
+            txid.to_string(),
+            Some(RpcTransactionSubscribeConfig {
+                commitment: Some(CommitmentConfig::finalized()),
+                enable_received_notification: Some(true),
+            }),
+        )
+        .unwrap();
+        let received_slot = 1;
+        rpc_subscriptions
+            .notify_transactions_received((received_slot, vec![TransactionIdentifier::Txid(txid)]));
+
+        let response = receiver.recv();
+        let expected_res =
+            RpcTransactionResult::ReceivedTransaction(ReceivedTransactionResult::ReceivedTransaction);
+        let expected = json!({
+           "jsonrpc": "2.0",
+           "method": "transactionNotification",
+           "params": {
+               "result": {
+                   "context": { "slot": received_slot },
+                   "value": expected_res,
+               },
+               "subscription": 1,
            }
         });
         assert_eq!(

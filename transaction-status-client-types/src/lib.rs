@@ -9,6 +9,7 @@
 )]
 //! Core types for solana-transaction-status
 use {
+    agave_native_auth::{NativeAuthEntry, NativeAuthScheme},
     crate::option_serializer::OptionSerializer,
     base64::{prelude::BASE64_STANDARD, Engine},
     core::fmt,
@@ -90,6 +91,7 @@ pub enum EncodeError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedTransactionStatusWithSignature {
     pub signature: Signature,
+    pub transaction_id: String,
     pub slot: u64,
     pub err: Option<TransactionError>,
     pub memo: Option<String>,
@@ -115,6 +117,8 @@ pub struct UiConfirmedBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signatures: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewards: Option<Rewards>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_reward_partitions: Option<u64>,
@@ -128,6 +132,44 @@ pub struct UiConfirmedBlock {
 pub struct UiTransaction {
     pub signatures: Vec<String>,
     pub message: UiMessage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiNativeAuthScheme {
+    Ed25519,
+    MlDsa44,
+    FnDsa512,
+    SlhDsaShake128s,
+}
+
+impl From<NativeAuthScheme> for UiNativeAuthScheme {
+    fn from(value: NativeAuthScheme) -> Self {
+        match value {
+            NativeAuthScheme::Ed25519 => Self::Ed25519,
+            NativeAuthScheme::MlDsa44 => Self::MlDsa44,
+            NativeAuthScheme::FnDsa512 => Self::FnDsa512,
+            NativeAuthScheme::SlhDsaShake128s => Self::SlhDsaShake128s,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiNativeAuthEntry {
+    pub scheme: UiNativeAuthScheme,
+    pub verifier_key: String,
+    pub proof: String,
+}
+
+impl From<&NativeAuthEntry> for UiNativeAuthEntry {
+    fn from(value: &NativeAuthEntry) -> Self {
+        Self {
+            scheme: value.scheme.into(),
+            verifier_key: BASE64_STANDARD.encode(&value.verifier_key),
+            proof: BASE64_STANDARD.encode(&value.proof),
+        }
+    }
 }
 
 /// A duplicate representation of a Message, in parsed format, for pretty JSON serialization
@@ -203,6 +245,10 @@ pub struct EncodedTransactionWithStatusMeta {
     pub meta: Option<UiTransactionStatusMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<TransactionVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_auth_entries: Option<Vec<UiNativeAuthEntry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,5 +1,6 @@
 use {
     crate::rpc_subscriptions::{NotificationEntry, RpcNotification, TimestampedNotificationEntry},
+    agave_native_auth::TransactionIdentifier,
     dashmap::{mapref::entry::Entry as DashEntry, DashMap},
     serde::{Deserialize, Serialize},
     solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig},
@@ -48,6 +49,7 @@ pub enum SubscriptionParams {
     Logs(LogsSubscriptionParams),
     Program(ProgramSubscriptionParams),
     Signature(SignatureSubscriptionParams),
+    Transaction(TransactionSubscriptionParams),
     Slot,
     SlotsUpdates,
     Root,
@@ -61,6 +63,7 @@ impl SubscriptionParams {
             SubscriptionParams::Logs(_) => "logsNotification",
             SubscriptionParams::Program(_) => "programNotification",
             SubscriptionParams::Signature(_) => "signatureNotification",
+            SubscriptionParams::Transaction(_) => "transactionNotification",
             SubscriptionParams::Slot => "slotNotification",
             SubscriptionParams::SlotsUpdates => "slotsUpdatesNotification",
             SubscriptionParams::Block(_) => "blockNotification",
@@ -75,6 +78,7 @@ impl SubscriptionParams {
             SubscriptionParams::Logs(params) => Some(params.commitment),
             SubscriptionParams::Program(params) => Some(params.commitment),
             SubscriptionParams::Signature(params) => Some(params.commitment),
+            SubscriptionParams::Transaction(params) => Some(params.commitment),
             SubscriptionParams::Block(params) => Some(params.commitment),
             SubscriptionParams::Slot
             | SubscriptionParams::SlotsUpdates
@@ -90,6 +94,7 @@ impl SubscriptionParams {
             SubscriptionParams::Logs(params) => &params.commitment,
             SubscriptionParams::Program(params) => &params.commitment,
             SubscriptionParams::Signature(params) => &params.commitment,
+            SubscriptionParams::Transaction(params) => &params.commitment,
             SubscriptionParams::Root
             | SubscriptionParams::Slot
             | SubscriptionParams::SlotsUpdates
@@ -105,6 +110,7 @@ impl SubscriptionParams {
             SubscriptionParams::Logs(params) => &params.commitment,
             SubscriptionParams::Program(params) => &params.commitment,
             SubscriptionParams::Signature(params) => &params.commitment,
+            SubscriptionParams::Transaction(params) => &params.commitment,
             SubscriptionParams::Root
             | SubscriptionParams::Slot
             | SubscriptionParams::SlotsUpdates
@@ -174,6 +180,13 @@ pub struct ProgramSubscriptionParams {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SignatureSubscriptionParams {
     pub signature: Signature,
+    pub commitment: CommitmentConfig,
+    pub enable_received_notification: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TransactionSubscriptionParams {
+    pub transaction_id: TransactionIdentifier,
     pub commitment: CommitmentConfig,
     pub enable_received_notification: bool,
 }
@@ -419,6 +432,7 @@ impl LogsSubscriptionsIndex {
 pub struct SubscriptionsTracker {
     logs_subscriptions_index: LogsSubscriptionsIndex,
     by_signature: HashMap<Signature, HashMap<SubscriptionId, Arc<SubscriptionInfo>>>,
+    by_transaction: HashMap<TransactionIdentifier, HashMap<SubscriptionId, Arc<SubscriptionInfo>>>,
     // Accounts, logs, programs, signatures (not gossip)
     commitment_watchers: HashMap<SubscriptionId, Arc<SubscriptionInfo>>,
     // Accounts, logs, programs, signatures (gossip)
@@ -437,6 +451,7 @@ impl SubscriptionsTracker {
                 bank_forks,
             },
             by_signature: HashMap::new(),
+            by_transaction: HashMap::new(),
             commitment_watchers: HashMap::new(),
             gossip_watchers: HashMap::new(),
             node_progress_watchers: HashMap::new(),
@@ -463,6 +478,12 @@ impl SubscriptionsTracker {
             SubscriptionParams::Signature(params) => {
                 self.by_signature
                     .entry(params.signature)
+                    .or_default()
+                    .insert(id, Arc::clone(&info));
+            }
+            SubscriptionParams::Transaction(params) => {
+                self.by_transaction
+                    .entry(params.transaction_id)
                     .or_default()
                     .insert(id, Arc::clone(&info));
             }
@@ -498,6 +519,20 @@ impl SubscriptionsTracker {
                     warn!("Subscriptions inconsistency (missing entry in by_signature)");
                 }
             }
+            SubscriptionParams::Transaction(params) => {
+                if let Entry::Occupied(mut entry) =
+                    self.by_transaction.entry(params.transaction_id)
+                {
+                    if entry.get_mut().remove(&id).is_none() {
+                        warn!("Subscriptions inconsistency (missing entry in by_transaction)");
+                    }
+                    if entry.get_mut().is_empty() {
+                        entry.remove();
+                    }
+                } else {
+                    warn!("Subscriptions inconsistency (missing entry in by_transaction)");
+                }
+            }
             _ => {}
         }
         if params.is_commitment_watcher() {
@@ -521,6 +556,12 @@ impl SubscriptionsTracker {
         &self,
     ) -> &HashMap<Signature, HashMap<SubscriptionId, Arc<SubscriptionInfo>>> {
         &self.by_signature
+    }
+
+    pub fn by_transaction(
+        &self,
+    ) -> &HashMap<TransactionIdentifier, HashMap<SubscriptionId, Arc<SubscriptionInfo>>> {
+        &self.by_transaction
     }
 
     pub fn commitment_watchers(&self) -> &HashMap<SubscriptionId, Arc<SubscriptionInfo>> {

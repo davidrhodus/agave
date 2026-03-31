@@ -17,6 +17,7 @@ use {
         nonblocking::{self, rpc_client::get_rpc_request_str},
         rpc_sender::*,
     },
+    agave_native_auth::TransactionIdentifier,
     serde::Serialize,
     serde_json::Value,
     solana_account::{Account, ReadableAccount},
@@ -1455,6 +1456,22 @@ impl RpcClient {
         self.invoke((self.rpc_client.as_ref()).get_signature_statuses_with_history(signatures))
     }
 
+    pub fn get_transaction_statuses_by_id(
+        &self,
+        transaction_ids: &[TransactionIdentifier],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.invoke((self.rpc_client.as_ref()).get_transaction_statuses_by_id(transaction_ids))
+    }
+
+    pub fn get_transaction_statuses_by_id_with_history(
+        &self,
+        transaction_ids: &[TransactionIdentifier],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.invoke(
+            (self.rpc_client.as_ref()).get_transaction_statuses_by_id_with_history(transaction_ids),
+        )
+    }
+
     /// Check if a transaction has been processed with the given [commitment level][cl].
     ///
     /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
@@ -2505,6 +2522,24 @@ impl RpcClient {
         config: RpcTransactionConfig,
     ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
         self.invoke((self.rpc_client.as_ref()).get_transaction_with_config(signature, config))
+    }
+
+    pub fn get_transaction_by_id(
+        &self,
+        transaction_id: &TransactionIdentifier,
+        encoding: UiTransactionEncoding,
+    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
+        self.invoke((self.rpc_client.as_ref()).get_transaction_by_id(transaction_id, encoding))
+    }
+
+    pub fn get_transaction_by_id_with_config(
+        &self,
+        transaction_id: &TransactionIdentifier,
+        config: RpcTransactionConfig,
+    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
+        self.invoke(
+            (self.rpc_client.as_ref()).get_transaction_by_id_with_config(transaction_id, config),
+        )
     }
 
     /// Returns the estimated production time of a block.

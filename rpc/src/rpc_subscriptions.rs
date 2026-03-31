@@ -10,9 +10,10 @@ use {
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
             LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
             SignatureSubscriptionParams, SubscriptionControl, SubscriptionId, SubscriptionInfo,
-            SubscriptionParams, SubscriptionsTracker,
+            SubscriptionParams, SubscriptionsTracker, TransactionSubscriptionParams,
         },
     },
+    agave_native_auth::TransactionIdentifier,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
     itertools::Either,
     rayon::prelude::*,
@@ -26,9 +27,10 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     solana_rpc_client_api::response::{
-        ProcessedSignatureResult, ReceivedSignatureResult, Response as RpcResponse, RpcBlockUpdate,
-        RpcBlockUpdateError, RpcKeyedAccount, RpcLogsResponse, RpcResponseContext,
-        RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
+        ProcessedSignatureResult, ProcessedTransactionResult, ReceivedSignatureResult,
+        ReceivedTransactionResult, Response as RpcResponse, RpcBlockUpdate, RpcBlockUpdateError,
+        RpcKeyedAccount, RpcLogsResponse, RpcResponseContext, RpcSignatureResult,
+        RpcTransactionResult, RpcVote, SlotInfo, SlotUpdate,
     },
     solana_runtime::{
         bank::{Bank, TransactionLogInfo},
@@ -102,6 +104,7 @@ pub enum NotificationEntry {
     Bank(CommitmentSlots),
     Gossip(Slot),
     SignaturesReceived((Slot, Vec<Signature>)),
+    TransactionsReceived((Slot, Vec<TransactionIdentifier>)),
     Subscribed(SubscriptionParams, SubscriptionId),
     Unsubscribed(SubscriptionParams, SubscriptionId),
 }
@@ -120,6 +123,9 @@ impl std::fmt::Debug for NotificationEntry {
             }
             NotificationEntry::SignaturesReceived(slot_signatures) => {
                 write!(f, "SignaturesReceived({slot_signatures:?})")
+            }
+            NotificationEntry::TransactionsReceived(slot_transactions) => {
+                write!(f, "TransactionsReceived({slot_transactions:?})")
             }
             NotificationEntry::Gossip(slot) => write!(f, "Gossip({slot:?})"),
             NotificationEntry::Subscribed(params, id) => {
@@ -410,6 +416,22 @@ fn filter_signature_result(
     )
 }
 
+fn filter_transaction_result(
+    result: Option<transaction::Result<()>>,
+    _params: &TransactionSubscriptionParams,
+    last_notified_slot: Slot,
+    _bank: Arc<Bank>,
+) -> (Option<RpcTransactionResult>, Slot) {
+    (
+        result.map(|result| {
+            RpcTransactionResult::ProcessedTransaction(ProcessedTransactionResult {
+                err: result.err().map(Into::into),
+            })
+        }),
+        last_notified_slot,
+    )
+}
+
 fn filter_program_results(
     accounts: Vec<(Pubkey, AccountSharedData)>,
     params: &ProgramSubscriptionParams,
@@ -448,6 +470,7 @@ fn filter_logs_results(
 ) -> (impl Iterator<Item = RpcLogsResponse>, Slot) {
     let responses = logs.into_iter().flatten().map(|log| RpcLogsResponse {
         signature: log.signature.to_string(),
+        transaction_id: log.transaction_id,
         err: log.result.err().map(Into::into),
         logs: log.log_messages,
     });
@@ -727,6 +750,13 @@ impl RpcSubscriptions {
         self.enqueue_notification(NotificationEntry::SignaturesReceived(slot_signatures));
     }
 
+    pub fn notify_transactions_received(
+        &self,
+        slot_transactions: (Slot, Vec<TransactionIdentifier>),
+    ) {
+        self.enqueue_notification(NotificationEntry::TransactionsReceived(slot_transactions));
+    }
+
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
         self.enqueue_notification(NotificationEntry::Vote((vote_pubkey, vote, signature)));
     }
@@ -893,6 +923,34 @@ impl RpcSubscriptions {
                                 }
                             }
                         }
+                        NotificationEntry::TransactionsReceived((slot, slot_transactions)) => {
+                            for slot_transaction in &slot_transactions {
+                                if let Some(subs) =
+                                    subscriptions.by_transaction().get(slot_transaction)
+                                {
+                                    for subscription in subs.values() {
+                                        if let SubscriptionParams::Transaction(params) =
+                                            subscription.params()
+                                        {
+                                            if params.enable_received_notification {
+                                                notifier.notify(
+                                                    RpcResponse::from(RpcNotificationResponse {
+                                                        context: RpcNotificationContext { slot },
+                                                        value: RpcTransactionResult::ReceivedTransaction(
+                                                            ReceivedTransactionResult::ReceivedTransaction,
+                                                        ),
+                                                    }),
+                                                    subscription,
+                                                    false,
+                                                );
+                                            }
+                                        } else {
+                                            error!("invalid params type in visit_by_transaction");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
@@ -935,6 +993,9 @@ impl RpcSubscriptions {
 
         let num_signatures_found = AtomicUsize::new(0);
         let num_signatures_notified = AtomicUsize::new(0);
+
+        let num_transactions_found = AtomicUsize::new(0);
+        let num_transactions_notified = AtomicUsize::new(0);
 
         let subscriptions = subscriptions.into_par_iter();
         subscriptions.for_each(|(_id, subscription)| {
@@ -1116,6 +1177,30 @@ impl RpcSubscriptions {
                         }
                     }
                 }
+                SubscriptionParams::Transaction(params) => {
+                    num_transactions_found.fetch_add(1, Ordering::Relaxed);
+                    if let Some(slot) = slot {
+                        let notified = check_commitment_and_notify(
+                            params,
+                            subscription,
+                            bank_forks,
+                            slot,
+                            |bank, params| match params.transaction_id {
+                                TransactionIdentifier::Signature(signature) => bank
+                                    .get_signature_status_processed_since_parent(&signature),
+                                TransactionIdentifier::Txid(txid) => bank
+                                    .get_transaction_status_processed_since_parent(&txid),
+                            },
+                            filter_transaction_result,
+                            notifier,
+                            true, // Unsubscribe.
+                        );
+
+                        if notified {
+                            num_transactions_notified.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 _ => error!("wrong subscription type in alps map"),
             }
         });
@@ -1125,12 +1210,12 @@ impl RpcSubscriptions {
         let total_notified = num_accounts_notified.load(Ordering::Relaxed)
             + num_logs_notified.load(Ordering::Relaxed)
             + num_programs_notified.load(Ordering::Relaxed)
-            + num_signatures_notified.load(Ordering::Relaxed);
+            + num_signatures_notified.load(Ordering::Relaxed)
+            + num_transactions_notified.load(Ordering::Relaxed);
         let total_ms = total_time.as_ms();
         if total_notified > 0 || total_ms > 10 {
             debug!(
-                "notified({}): accounts: {} / {} logs: {} / {} programs: {} / {} signatures: {} / \
-                 {}",
+                "notified({}): accounts: {} / {} logs: {} / {} programs: {} / {} signatures: {} / {} transactions: {} / {}",
                 source,
                 num_accounts_found.load(Ordering::Relaxed),
                 num_accounts_notified.load(Ordering::Relaxed),
@@ -1140,6 +1225,8 @@ impl RpcSubscriptions {
                 num_programs_notified.load(Ordering::Relaxed),
                 num_signatures_found.load(Ordering::Relaxed),
                 num_signatures_notified.load(Ordering::Relaxed),
+                num_transactions_found.load(Ordering::Relaxed),
+                num_transactions_notified.load(Ordering::Relaxed),
             );
             datapoint_info!(
                 "rpc_subscriptions",
@@ -1182,6 +1269,16 @@ impl RpcSubscriptions {
                 (
                     "num_signatures_notified",
                     num_signatures_notified.load(Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_transaction_subscriptions",
+                    num_transactions_found.load(Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_transactions_notified",
+                    num_transactions_notified.load(Ordering::Relaxed),
                     i64
                 ),
                 ("notifications_time", total_time.as_us() as i64, i64),
@@ -2911,6 +3008,7 @@ pub(crate) mod tests {
                     },
                     "value": {
                         "signature": signature,
+                        "transactionId": signature,
                         "err": null,
                         "logs": [
                             "Program 11111111111111111111111111111111 invoke [1]",

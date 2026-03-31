@@ -12,6 +12,7 @@ message TransactionByAddrInfo {
     uint32 index = 3;
     Memo memo = 4;
     UnixTimestamp block_time = 5;
+    string transaction_id = 6;
 }
 
 message Memo {

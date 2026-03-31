@@ -1,4 +1,5 @@
 use {
+    agave_native_auth::{verify_entries, NativeAuthEntryRef},
     super::{ComputeBudgetInstructionDetails, RuntimeTransaction},
     crate::{
         instruction_meta::InstructionMeta,
@@ -44,9 +45,25 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
         message_hash: MessageHash,
         is_simple_vote_tx: Option<bool>,
     ) -> Result<Self> {
+        if matches!(transaction.version(), TransactionVersion::V1) {
+            verify_entries(
+                transaction.message_data(),
+                &transaction.static_account_keys()
+                    [..usize::from(transaction.num_required_signatures())],
+                transaction.native_auth_entries().iter().map(|entry| NativeAuthEntryRef {
+                    scheme: entry.scheme,
+                    verifier_key: &entry.verifier_key,
+                    proof: &entry.proof,
+                }),
+            )
+            .map_err(|_| TransactionError::SignatureFailure)?;
+        }
         let message_hash = match message_hash {
             MessageHash::Precomputed(hash) => hash,
-            MessageHash::Compute => VersionedMessage::hash_raw_message(transaction.message_data()),
+            MessageHash::Compute => transaction
+                .transaction_id()
+                .copied()
+                .unwrap_or_else(|| VersionedMessage::hash_raw_message(transaction.message_data())),
         };
         let is_simple_vote_tx =
             is_simple_vote_tx.unwrap_or_else(|| is_simple_vote_transaction(&transaction));
@@ -55,6 +72,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
             precompile_signature_details,
             instruction_data_len,
         } = InstructionMeta::try_new(transaction.program_instructions_iter())?;
+        let is_v1_transaction = matches!(transaction.version(), TransactionVersion::V1);
 
         let signature_details = TransactionSignatureDetails::new(
             u64::from(transaction.num_required_signatures()),
@@ -70,6 +88,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
             meta: TransactionMeta {
                 message_hash,
                 is_simple_vote_transaction: is_simple_vote_tx,
+                is_v1_transaction,
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
@@ -111,6 +130,7 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
         let VersionedTransaction {
             signatures,
             message,
+            native_auth_entries,
         } = self.to_versioned_transaction();
 
         let is_writable_account_cache = (0..self.transaction.total_num_accounts())
@@ -133,11 +153,12 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
         // - Simple conversion between different formats
         // - `ResolvedTransactionView` has undergone sanitization checks
         Cow::Owned(
-            SanitizedTransaction::try_new_from_fields(
+            SanitizedTransaction::try_new_from_fields_with_native_auth(
                 message,
                 *self.message_hash(),
                 self.is_simple_vote_transaction(),
                 signatures,
+                native_auth_entries,
             )
             .expect("transaction view is sanitized"),
         )
@@ -169,7 +190,8 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
                     instructions,
                 })
             }
-            TransactionVersion::V0 => VersionedMessage::V0(solana_message::v0::Message {
+            TransactionVersion::V0 | TransactionVersion::V1 => {
+                VersionedMessage::V0(solana_message::v0::Message {
                 header,
                 account_keys: static_account_keys,
                 recent_blockhash,
@@ -182,12 +204,14 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
                         readonly_indexes: atl.readonly_indexes.to_vec(),
                     })
                     .collect(),
-            }),
+                })
+            }
         };
 
         VersionedTransaction {
             signatures: self.signatures().to_vec(),
             message,
+            native_auth_entries: self.native_auth_entries().to_vec(),
         }
     }
 }
@@ -299,6 +323,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            native_auth_entries: vec![],
         };
         assert_translation(
             original_transaction,
@@ -377,6 +402,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            native_auth_entries: vec![],
         };
         let loaded_addresses = LoadedAddresses {
             writable: vec![to],

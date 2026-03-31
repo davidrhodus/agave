@@ -20,6 +20,7 @@ name = "solana_storage_bigtable"
 agave-unstable-api = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 agave-reserved-account-keys = { workspace = true }
 backoff = { workspace = true, features = ["tokio"] }
 bincode = { workspace = true }
@@ -48,7 +49,7 @@ solana-serde = { workspace = true }
 solana-signature = { workspace = true }
 solana-storage-proto = { workspace = true }
 solana-time-utils = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["blake3"] }
 solana-transaction-error = { workspace = true }
 solana-transaction-status = { workspace = true }
 thiserror = { workspace = true }

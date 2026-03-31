@@ -21,6 +21,7 @@ agave-unstable-api = []
 dev-context-only-utils = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 bincode = { workspace = true }
 crossbeam-channel = { workspace = true }
 dlopen2 = { workspace = true }

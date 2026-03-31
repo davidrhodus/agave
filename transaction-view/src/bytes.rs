@@ -100,6 +100,7 @@ pub fn read_compressed_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
 /// * `bytes` - Slice of bytes to read from.
 /// * `offset` - Current offset into `bytes`.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn optimized_read_compressed_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
     let mut result = 0u16;
 

@@ -381,6 +381,7 @@ pub struct TransactionLogCollectorConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionLogInfo {
     pub signature: Signature,
+    pub transaction_id: String,
     pub result: Result<()>,
     pub is_vote: bool,
     pub log_messages: TransactionLogMessages,
@@ -2810,15 +2811,18 @@ impl Bank {
                     self.slot(),
                     processed_tx.status(),
                 );
-                // Add the transaction signature to the status cache so that transaction status
-                // can be queried by transaction signature over RPC. In the future, this should
-                // only be added for API nodes because voting validators don't need to do this.
-                status_cache.insert(
-                    tx.recent_blockhash(),
-                    tx.signature(),
-                    self.slot(),
-                    processed_tx.status(),
-                );
+                if !tx.to_versioned_transaction().is_v1() {
+                    // Add the transaction signature to the status cache so that transaction
+                    // status can be queried by transaction signature over RPC. In the future,
+                    // this should only be added for API nodes because voting validators don't
+                    // need to do this.
+                    status_cache.insert(
+                        tx.recent_blockhash(),
+                        tx.signature(),
+                        self.slot(),
+                        processed_tx.status(),
+                    );
+                }
             }
         }
     }
@@ -3030,6 +3034,16 @@ impl Bank {
         transactions: &'b [Tx],
         transaction_results: impl Iterator<Item = Result<()>>,
     ) -> TransactionBatch<'a, 'b, Tx> {
+        let native_auth_v1_enabled = self
+            .feature_set
+            .is_active(&agave_feature_set::enable_transaction_v1_native_auth::id());
+        let transaction_results = transactions.iter().zip(transaction_results).map(|(tx, result)| {
+            if tx.is_v1_transaction() && !native_auth_v1_enabled {
+                Err(TransactionError::SanitizeFailure)
+            } else {
+                result
+            }
+        });
         // this lock_results could be: Ok, AccountInUse, WouldExceedBlockMaxLimit or WouldExceedAccountMaxLimit
         TransactionBatch::new(
             self.try_lock_accounts_with_results(transactions, transaction_results),
@@ -3449,6 +3463,11 @@ impl Bank {
             Some((
                 TransactionLogInfo {
                     signature: *transaction.signature(),
+                    transaction_id: if transaction.is_v1_transaction() {
+                        transaction.message_hash().to_string()
+                    } else {
+                        transaction.signature().to_string()
+                    },
                     result: execution_details.status.clone(),
                     is_vote,
                     log_messages: log_messages.clone(),
@@ -4464,6 +4483,18 @@ impl Bank {
         None
     }
 
+    pub fn get_transaction_status_processed_since_parent(
+        &self,
+        transaction_id: &Hash,
+    ) -> Option<Result<()>> {
+        if let Some((slot, status)) = self.get_transaction_status_slot(transaction_id) {
+            if slot <= self.slot() {
+                return Some(status);
+            }
+        }
+        None
+    }
+
     pub fn get_signature_status_with_blockhash(
         &self,
         signature: &Signature,
@@ -4484,6 +4515,26 @@ impl Bank {
         rcache
             .get_status(message_hash, transaction_blockhash, &self.ancestors)
             .map(|(slot, status)| (slot, status.is_ok()))
+    }
+
+    pub fn get_transaction_status_with_blockhash(
+        &self,
+        transaction_id: &Hash,
+        blockhash: &Hash,
+    ) -> Option<Result<()>> {
+        let rcache = self.status_cache.read().unwrap();
+        rcache
+            .get_status(transaction_id, blockhash, &self.ancestors)
+            .map(|v| v.1)
+    }
+
+    pub fn get_transaction_status_slot(&self, transaction_id: &Hash) -> Option<(Slot, Result<()>)> {
+        let rcache = self.status_cache.read().unwrap();
+        rcache.get_status_any_blockhash(transaction_id, &self.ancestors)
+    }
+
+    pub fn get_transaction_status(&self, transaction_id: &Hash) -> Option<Result<()>> {
+        self.get_transaction_status_slot(transaction_id).map(|v| v.1)
     }
 
     pub fn get_signature_status_slot(&self, signature: &Signature) -> Option<(Slot, Result<()>)> {

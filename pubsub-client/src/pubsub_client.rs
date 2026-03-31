@@ -88,6 +88,7 @@
 
 pub use crate::nonblocking::pubsub_client::PubsubClientError;
 use {
+    agave_native_auth::TransactionIdentifier,
     crossbeam_channel::{unbounded, Receiver, Sender},
     log::*,
     serde::de::DeserializeOwned,
@@ -102,12 +103,13 @@ use {
     solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
-            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
-            RpcTransactionLogsFilter,
+            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+            RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+            RpcTransactionSubscribeConfig,
         },
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
-            RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
+            RpcSignatureResult, RpcTransactionResult, RpcVote, SlotInfo, SlotUpdate,
         },
     },
     solana_signature::Signature,
@@ -278,6 +280,13 @@ pub type PubsubSignatureClientSubscription =
 pub type SignatureSubscription = (
     PubsubSignatureClientSubscription,
     Receiver<RpcResponse<RpcSignatureResult>>,
+);
+
+pub type PubsubTransactionClientSubscription =
+    PubsubClientSubscription<RpcResponse<RpcTransactionResult>>;
+pub type TransactionSubscription = (
+    PubsubTransactionClientSubscription,
+    Receiver<RpcResponse<RpcTransactionResult>>,
 );
 
 pub type PubsubBlockClientSubscription = PubsubClientSubscription<RpcResponse<RpcBlockUpdate>>;
@@ -686,6 +695,49 @@ impl PubsubClient {
         let result = PubsubClientSubscription {
             message_type: PhantomData,
             operation: "signature",
+            socket,
+            subscription_id,
+            t_cleanup: Some(t_cleanup),
+            exit,
+        };
+
+        Ok((result, receiver))
+    }
+
+    /// Subscribe to canonical transaction confirmation events.
+    pub fn transaction_subscribe<R: IntoClientRequest>(
+        request: R,
+        transaction_id: &TransactionIdentifier,
+        config: Option<RpcTransactionSubscribeConfig>,
+    ) -> Result<TransactionSubscription, PubsubClientError> {
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
+        let (sender, receiver) = unbounded();
+
+        let socket = Arc::new(RwLock::new(socket));
+        let socket_clone = socket.clone();
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_clone = exit.clone();
+        let body = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"transactionSubscribe",
+            "params":[
+                transaction_id.to_string(),
+                config
+            ]
+        })
+        .to_string();
+        let subscription_id =
+            PubsubTransactionClientSubscription::send_subscribe(&socket_clone, body)?;
+
+        let t_cleanup = std::thread::spawn(move || {
+            Self::cleanup_with_sender(exit_clone, &socket_clone, sender)
+        });
+
+        let result = PubsubClientSubscription {
+            message_type: PhantomData,
+            operation: "transaction",
             socket,
             subscription_id,
             t_cleanup: Some(t_cleanup),

@@ -1,4 +1,5 @@
 use {
+    agave_native_auth::TransactionIdentifier,
     crate::{
         send_transaction_service_stats::{
             SendTransactionServiceStats, SendTransactionServiceStatsReport,
@@ -15,7 +16,6 @@ use {
         bank::Bank,
         bank_forks::{BankForks, BankPair},
     },
-    solana_signature::Signature,
     std::{
         collections::hash_map::{Entry, HashMap},
         net::SocketAddr,
@@ -65,7 +65,7 @@ pub struct SendTransactionService {
 
 pub struct TransactionInfo {
     pub message_hash: Hash,
-    pub signature: Signature,
+    pub identifier: TransactionIdentifier,
     pub blockhash: Hash,
     pub wire_transaction: Vec<u8>,
     pub last_valid_block_height: u64,
@@ -79,7 +79,7 @@ pub struct TransactionInfo {
 impl TransactionInfo {
     pub fn new(
         message_hash: Hash,
-        signature: Signature,
+        identifier: impl Into<TransactionIdentifier>,
         blockhash: Hash,
         wire_transaction: Vec<u8>,
         last_valid_block_height: u64,
@@ -89,7 +89,7 @@ impl TransactionInfo {
     ) -> Self {
         Self {
             message_hash,
-            signature,
+            identifier: identifier.into(),
             blockhash,
             wire_transaction,
             last_valid_block_height,
@@ -196,7 +196,7 @@ impl SendTransactionService {
     fn receive_txn_thread<Client: TransactionClient + std::marker::Send + 'static>(
         receiver: Receiver<TransactionInfo>,
         client: Client,
-        retry_transactions: Arc<Mutex<HashMap<Signature, TransactionInfo>>>,
+        retry_transactions: Arc<Mutex<HashMap<TransactionIdentifier, TransactionInfo>>>,
         Config {
             batch_send_rate_ms,
             batch_size,
@@ -229,13 +229,13 @@ impl SendTransactionService {
                     Err(RecvTimeoutError::Timeout) => {}
                     Ok(transaction_info) => {
                         stats.received_transactions.fetch_add(1, Ordering::Relaxed);
-                        let entry = transactions.entry(transaction_info.signature);
+                        let entry = transactions.entry(transaction_info.identifier);
                         let mut new_transaction = false;
                         if let Entry::Vacant(_) = entry {
                             if !retry_transactions
                                 .lock()
                                 .unwrap()
-                                .contains_key(&transaction_info.signature)
+                                .contains_key(&transaction_info.identifier)
                             {
                                 entry.or_insert(transaction_info);
                                 new_transaction = true;
@@ -267,7 +267,7 @@ impl SendTransactionService {
                         let mut retry_transactions = retry_transactions.lock().unwrap();
                         let mut transactions_to_retry: usize = 0;
                         let mut transactions_added_to_retry = Saturating::<usize>(0);
-                        for (signature, mut transaction_info) in transactions.drain() {
+                        for (identifier, mut transaction_info) in transactions.drain() {
                             // drop transactions with 0 max retries
                             let max_retries = transaction_info
                                 .get_max_retries(default_max_retries, service_max_retries);
@@ -277,7 +277,7 @@ impl SendTransactionService {
                             transactions_to_retry += 1;
 
                             let retry_len = retry_transactions.len();
-                            let entry = retry_transactions.entry(signature);
+                            let entry = retry_transactions.entry(identifier);
                             if let Entry::Vacant(_) = entry {
                                 if retry_len >= retry_pool_max_size {
                                     break;
@@ -308,7 +308,7 @@ impl SendTransactionService {
     fn retry_thread<Client: TransactionClient + std::marker::Send + 'static>(
         bank_forks: Arc<RwLock<BankForks>>,
         client: Client,
-        retry_transactions: Arc<Mutex<HashMap<Signature, TransactionInfo>>>,
+        retry_transactions: Arc<Mutex<HashMap<TransactionIdentifier, TransactionInfo>>>,
         config: Config,
         stats_report: Arc<SendTransactionServiceStatsReport>,
         exit: Arc<AtomicBool>,
@@ -366,7 +366,7 @@ impl SendTransactionService {
     fn process_transactions<Client: TransactionClient + std::marker::Send + 'static>(
         working_bank: &Bank,
         root_bank: &Bank,
-        transactions: &mut HashMap<Signature, TransactionInfo>,
+        transactions: &mut HashMap<TransactionIdentifier, TransactionInfo>,
         client: &Client,
         &Config {
             retry_rate_ms,
@@ -383,7 +383,7 @@ impl SendTransactionService {
         let mut exceeded_retries_transactions = Vec::new();
         let retry_rate = Duration::from_millis(retry_rate_ms);
 
-        transactions.retain(|signature, transaction_info| {
+        transactions.retain(|identifier, transaction_info| {
             if transaction_info.durable_nonce_info.is_some() {
                 stats.nonced_transactions.fetch_add(1, Ordering::Relaxed);
             }
@@ -394,7 +394,7 @@ impl SendTransactionService {
                 )
                 .is_some()
             {
-                info!("Transaction is rooted: {signature}");
+                info!("Transaction is rooted: {identifier}");
                 result.rooted += 1;
                 stats.rooted_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -414,14 +414,14 @@ impl SendTransactionService {
                 let verify_nonce_account =
                     nonce_account::verify_nonce_account(&nonce_account, &durable_nonce);
                 if verify_nonce_account.is_none() && signature_status.is_none() && expired {
-                    info!("Dropping expired durable-nonce transaction: {signature}");
+                    info!("Dropping expired durable-nonce transaction: {identifier}");
                     result.expired += 1;
                     stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
             }
             if transaction_info.last_valid_block_height < root_bank.block_height() {
-                info!("Dropping expired transaction: {signature}");
+                info!("Dropping expired transaction: {identifier}");
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -432,7 +432,7 @@ impl SendTransactionService {
 
             if let Some(max_retries) = max_retries {
                 if transaction_info.retries >= max_retries {
-                    info!("Dropping transaction due to max retries: {signature}");
+                    info!("Dropping transaction due to max retries: {identifier}");
                     result.max_retries_elapsed += 1;
                     stats
                         .transactions_exceeding_max_retries
@@ -454,19 +454,19 @@ impl SendTransactionService {
                             // Transaction sent before is unknown to the working bank, it might have been
                             // dropped or landed in another fork. Re-send it.
 
-                            info!("Retrying transaction: {signature}");
+                            info!("Retrying transaction: {identifier}");
                             result.retried += 1;
                             transaction_info.retries += 1;
                         }
 
-                        batched_transactions.push(*signature);
+                        batched_transactions.push(*identifier);
                         transaction_info.last_sent_time = Some(now);
 
                         let max_retries = transaction_info
                             .get_max_retries(default_max_retries, service_max_retries);
                         if let Some(max_retries) = max_retries {
                             if transaction_info.retries >= max_retries {
-                                exceeded_retries_transactions.push(*signature);
+                                exceeded_retries_transactions.push(*identifier);
                             }
                         }
                     } else if let Some(last) = transaction_info.last_sent_time {
@@ -481,7 +481,7 @@ impl SendTransactionService {
                 }
                 Some((_slot, status)) => {
                     if !status {
-                        info!("Dropping failed transaction: {signature}");
+                        info!("Dropping failed transaction: {identifier}");
                         result.failed += 1;
                         stats.failed_transactions.fetch_add(1, Ordering::Relaxed);
                         false
@@ -499,7 +499,7 @@ impl SendTransactionService {
             // Processing the transactions in batch
             let wire_transactions = batched_transactions
                 .iter()
-                .filter_map(|signature| transactions.get(signature))
+                .filter_map(|identifier| transactions.get(identifier))
                 .map(|transaction_info| transaction_info.wire_transaction.clone());
 
             let iter = wire_transactions.chunks(batch_size);
@@ -513,9 +513,9 @@ impl SendTransactionService {
         stats
             .transactions_exceeding_max_retries
             .fetch_add(result.max_retries_elapsed, Ordering::Relaxed);
-        for signature in exceeded_retries_transactions {
-            info!("Dropping transaction due to max retries: {signature}");
-            transactions.remove(&signature);
+        for identifier in exceeded_retries_transactions {
+            info!("Dropping transaction due to max retries: {identifier}");
+            transactions.remove(&identifier);
         }
 
         result
@@ -541,6 +541,7 @@ mod test {
         solana_genesis_config::create_genesis_config,
         solana_nonce::{self as nonce, state::DurableNonce},
         solana_pubkey::Pubkey,
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_system_interface::program as system_program,
         solana_system_transaction as system_transaction,
@@ -588,7 +589,7 @@ mod test {
 
         let dummy_tx_info = || TransactionInfo {
             message_hash: Hash::default(),
-            signature: Signature::default(),
+            identifier: Signature::default().into(),
             blockhash: Hash::default(),
             wire_transaction: vec![0; 128],
             last_valid_block_height: 0,

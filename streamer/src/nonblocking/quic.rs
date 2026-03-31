@@ -8,7 +8,10 @@ use {
             stream_throttle::ConnectionStreamCounter,
             swqos::{SwQos, SwQosConfig},
         },
-        quic::{configure_server, QuicServerError, QuicStreamerConfig, StreamerStats},
+        quic::{
+            configure_server, QuicServerError, QuicStreamerConfig, StreamerStats,
+            MAX_QUIC_TRANSACTION_SIZE,
+        },
         streamer::StakedNodes,
     },
     bytes::{BufMut, Bytes, BytesMut},
@@ -20,7 +23,7 @@ use {
     smallvec::SmallVec,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_packet::{Meta, PACKET_DATA_SIZE},
+    solana_packet::Meta,
     solana_perf::packet::{BytesPacket, BytesPacketBatch, PacketBatch, PACKETS_PER_BATCH},
     solana_pubkey::Pubkey,
     solana_signature::Signature,
@@ -953,10 +956,7 @@ fn handle_chunks(
     let n_chunks = chunks.len();
     for chunk in chunks {
         accum.meta.size += chunk.len();
-        if accum.meta.size > PACKET_DATA_SIZE {
-            // The stream window size is set to PACKET_DATA_SIZE, so one individual chunk can
-            // never exceed this size. A peer can send two chunks that together exceed the size
-            // tho, in which case we report the error.
+        if accum.meta.size > MAX_QUIC_TRANSACTION_SIZE {
             stats.invalid_stream_size.fetch_add(1, Ordering::Relaxed);
             debug!("invalid stream size {}", accum.meta.size);
             return Err(());
@@ -2212,7 +2212,7 @@ pub mod test {
 
         let mut send_stream = client_connection.open_uni().await.unwrap();
         send_stream
-            .write_all(&[42; PACKET_DATA_SIZE + 1])
+            .write_all(&vec![42; MAX_QUIC_TRANSACTION_SIZE + 1])
             .await
             .unwrap();
         match client_connection.closed().await {

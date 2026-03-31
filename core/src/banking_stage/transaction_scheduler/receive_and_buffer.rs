@@ -13,6 +13,7 @@ use {
         consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_feature_set::enable_transaction_v1_native_auth,
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
@@ -471,6 +472,14 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
         return Err(PacketHandlingError::Sanitization);
     }
 
+    if matches!(view.version(), TransactionVersion::V1)
+        && !working_bank
+            .feature_set
+            .is_active(&enable_transaction_v1_native_auth::id())
+    {
+        return Err(PacketHandlingError::Sanitization);
+    }
+
     if usize::from(view.total_num_accounts()) > transaction_account_lock_limit {
         return Err(PacketHandlingError::LockValidation);
     }
@@ -496,7 +505,7 @@ pub(crate) fn load_addresses_for_view<D: TransactionData>(
 ) -> Result<(Option<LoadedAddresses>, Slot), PacketHandlingError> {
     match view.version() {
         TransactionVersion::Legacy => Ok((None, u64::MAX)),
-        TransactionVersion::V0 => bank
+        TransactionVersion::V0 | TransactionVersion::V1 => bank
             .load_addresses_from_ref(view.address_table_lookup_iter())
             .map(|(loaded_addresses, deactivation_slot)| {
                 (Some(loaded_addresses), deactivation_slot)

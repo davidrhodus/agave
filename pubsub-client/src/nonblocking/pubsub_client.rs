@@ -167,6 +167,7 @@
 //! ```
 
 use {
+    agave_native_auth::TransactionIdentifier,
     futures_util::{
         future::{ready, BoxFuture, FutureExt},
         sink::SinkExt,
@@ -181,13 +182,14 @@ use {
     solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
-            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
-            RpcTransactionLogsFilter,
+            RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+            RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+            RpcTransactionSubscribeConfig,
         },
         error_object::RpcErrorObject,
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
-            RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
+            RpcSignatureResult, RpcTransactionResult, RpcVote, SlotInfo, SlotUpdate,
         },
     },
     solana_signature::Signature,
@@ -488,6 +490,15 @@ impl PubsubClient {
     ) -> SubscribeResult<'_, RpcResponse<RpcSignatureResult>> {
         let params = json!([signature.to_string(), config]);
         self.subscribe("signature", params).await
+    }
+
+    pub async fn transaction_subscribe(
+        &self,
+        transaction_id: &TransactionIdentifier,
+        config: Option<RpcTransactionSubscribeConfig>,
+    ) -> SubscribeResult<'_, RpcResponse<RpcTransactionResult>> {
+        let params = json!([transaction_id.to_string(), config]);
+        self.subscribe("transaction", params).await
     }
 
     /// Subscribe to slot events.

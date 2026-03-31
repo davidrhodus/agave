@@ -20,6 +20,7 @@ name = "solana_banks_client"
 agave-unstable-api = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 borsh = { workspace = true }
 futures = { workspace = true }
 solana-account = { workspace = true, features = ["bincode"] }

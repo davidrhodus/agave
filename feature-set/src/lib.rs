@@ -1203,6 +1203,10 @@ pub mod relax_programdata_account_check_migration {
     solana_pubkey::declare_id!("rexav5eNTUSNT1K2N7cfRjnthwhcP5BC25v2tA4rW4h");
 }
 
+pub mod enable_transaction_v1_native_auth {
+    solana_pubkey::declare_id!("Ft7jTyrgPEPs69KDDwGSRWsxNE7NqhHPcM7pBoTuHmGu");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2157,6 +2161,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             relax_programdata_account_check_migration::id(),
             "SIMD-0444: Relax program data account check in migration",
+        ),
+        (
+            enable_transaction_v1_native_auth::id(),
+            "Enable TransactionV1 native-auth admission",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]

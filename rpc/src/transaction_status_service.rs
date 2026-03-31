@@ -5,6 +5,7 @@
 
 use {
     crate::transaction_notifier_interface::TransactionNotifierArc,
+    agave_native_auth::TransactionIdentifier,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     itertools::izip,
     solana_clock::Slot,
@@ -209,11 +210,17 @@ impl TransactionStatusService {
                         let is_vote = transaction.is_simple_vote_transaction();
                         let message_hash = transaction.message_hash();
                         let signature = transaction.signature();
+                        let transaction_id = if transaction.is_v1() {
+                            TransactionIdentifier::Txid(*transaction.transaction_id())
+                        } else {
+                            TransactionIdentifier::Signature(*signature)
+                        };
                         let transaction = transaction.to_versioned_transaction();
                         transaction_notifier.notify_transaction(
                             slot,
                             transaction_index,
                             signature,
+                            &transaction_id,
                             message_hash,
                             is_vote,
                             &transaction_status_meta,
@@ -244,14 +251,26 @@ impl TransactionStatusService {
                             .enumerate()
                             .map(|(index, key)| (key, message.is_writable(index)));
 
-                        blockstore.add_transaction_status_to_batch(
-                            slot,
-                            *transaction.signature(),
-                            keys_with_writable,
-                            transaction_status_meta,
-                            transaction_index,
-                            batch,
-                        )?;
+                        if transaction.is_v1() {
+                            blockstore.add_transaction_status_to_batch_with_id(
+                                slot,
+                                *transaction.signature(),
+                                *transaction.transaction_id(),
+                                keys_with_writable,
+                                transaction_status_meta,
+                                transaction_index,
+                                batch,
+                            )?;
+                        } else {
+                            blockstore.add_transaction_status_to_batch(
+                                slot,
+                                *transaction.signature(),
+                                keys_with_writable,
+                                transaction_status_meta,
+                                transaction_index,
+                                batch,
+                            )?;
+                        }
                     }
                 }
 
@@ -337,6 +356,7 @@ pub(crate) mod tests {
     use {
         super::*,
         crate::transaction_notifier_interface::TransactionNotifier,
+        agave_native_auth::TransactionIdentifier,
         agave_reserved_account_keys::ReservedAccountKeys,
         crossbeam_channel::unbounded,
         dashmap::DashMap,
@@ -400,6 +420,7 @@ pub(crate) mod tests {
             slot: Slot,
             transaction_index: usize,
             _signature: &Signature,
+            _transaction_id: &TransactionIdentifier,
             message_hash: &Hash,
             _is_vote: bool,
             transaction_status_meta: &TransactionStatusMeta,

@@ -11,6 +11,7 @@
 
 use {
     crate::bigtable::RowKey,
+    agave_native_auth::TransactionIdentifier,
     agave_reserved_account_keys::ReservedAccountKeys,
     log::*,
     serde::{Deserialize, Serialize},
@@ -379,6 +380,7 @@ impl From<LegacyTransactionByAddrInfo> for TransactionByAddrInfo {
 
         Self {
             signature,
+            transaction_id: signature.to_string(),
             err,
             index,
             memo,
@@ -642,6 +644,27 @@ impl LedgerStorage {
         Ok(transaction_info.into())
     }
 
+    pub async fn get_transaction_status_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+    ) -> Result<TransactionStatus> {
+        trace!("LedgerStorage::get_transaction_status_by_identifier request received: {identifier:?}");
+        self.stats.increment_num_queries();
+        let mut bigtable = self.connection.client();
+        let (table_name, row_key) = match identifier {
+            TransactionIdentifier::Signature(signature) => ("tx", signature.to_string()),
+            TransactionIdentifier::Txid(txid) => ("tx-by-id", txid.to_string()),
+        };
+        let transaction_info = bigtable
+            .get_bincode_cell::<TransactionInfo>(table_name, row_key)
+            .await
+            .map_err(|err| match err {
+                bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                _ => err.into(),
+            })?;
+        Ok(transaction_info.into())
+    }
+
     // Fetches and gets a vector of confirmed transactions via a multirow fetch
     pub async fn get_confirmed_transactions(
         &self,
@@ -738,6 +761,50 @@ impl LedgerStorage {
                         block_time: block.block_time,
                     }))
                 }
+            }
+        }
+    }
+
+    async fn get_confirmed_transaction_by_row_key(
+        &self,
+        table_name: &str,
+        row_key: RowKey,
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        self.stats.increment_num_queries();
+        let mut bigtable = self.connection.client();
+        let TransactionInfo { slot, index, .. } = bigtable
+            .get_bincode_cell(table_name, row_key.clone())
+            .await
+            .map_err(|err| match err {
+                bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                _ => err.into(),
+            })?;
+
+        let block = self.get_confirmed_block(slot).await?;
+        match block.transactions.into_iter().nth(index as usize) {
+            None => {
+                warn!("Transaction info for {row_key} is corrupt");
+                Ok(None)
+            }
+            Some(tx_with_meta) => Ok(Some(ConfirmedTransactionWithStatusMeta {
+                slot,
+                tx_with_meta,
+                block_time: block.block_time,
+            })),
+        }
+    }
+
+    pub async fn get_confirmed_transaction_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        match identifier {
+            TransactionIdentifier::Signature(signature) => {
+                self.get_confirmed_transaction(signature).await
+            }
+            TransactionIdentifier::Txid(txid) => {
+                self.get_confirmed_transaction_by_row_key("tx-by-id", txid.to_string())
+                    .await
             }
         }
     }
@@ -872,6 +939,7 @@ impl LedgerStorage {
                 infos.push((
                     ConfirmedTransactionStatusWithSignature {
                         signature: tx_by_addr_info.signature,
+                        transaction_id: tx_by_addr_info.transaction_id,
                         slot,
                         err: tx_by_addr_info.err,
                         memo: tx_by_addr_info.memo,
@@ -919,11 +987,13 @@ impl LedgerStorage {
 
         let reserved_account_keys = ReservedAccountKeys::new_all_activated();
         let mut tx_cells = Vec::with_capacity(confirmed_block.transactions.len());
+        let mut tx_by_id_cells = Vec::new();
         for (index, transaction_with_meta) in confirmed_block.transactions.iter().enumerate() {
             let VersionedTransactionWithStatusMeta { meta, transaction } = transaction_with_meta;
             let err = meta.status.clone().err();
             let index = index as u32;
             let signature = transaction.signatures[0];
+            let transaction_id = transaction.transaction_identifier().to_string();
             let memo = extract_and_fmt_memos(transaction_with_meta);
 
             for address in transaction_with_meta.account_keys().iter() {
@@ -937,6 +1007,7 @@ impl LedgerStorage {
                         .or_default()
                         .push(TransactionByAddrInfo {
                             signature,
+                            transaction_id: transaction_id.clone(),
                             err: err.clone(),
                             index,
                             memo: memo.clone(),
@@ -954,6 +1025,18 @@ impl LedgerStorage {
                     memo,
                 },
             ));
+
+            if transaction.is_v1() {
+                tx_by_id_cells.push((
+                    transaction_id,
+                    TransactionInfo {
+                        slot,
+                        index,
+                        err: meta.status.clone().err(),
+                        memo: extract_and_fmt_memos(transaction_with_meta),
+                    },
+                ));
+            }
         }
 
         let tx_by_addr_cells: Vec<_> = by_addr
@@ -985,6 +1068,14 @@ impl LedgerStorage {
             let conn = self.connection.clone();
             tasks.push(tokio::spawn(async move {
                 conn.put_bincode_cells_with_retry::<TransactionInfo>("tx", &tx_cells)
+                    .await
+            }));
+        }
+
+        if !tx_by_id_cells.is_empty() {
+            let conn = self.connection.clone();
+            tasks.push(tokio::spawn(async move {
+                conn.put_bincode_cells_with_retry::<TransactionInfo>("tx-by-id", &tx_by_id_cells)
                     .await
             }));
         }
@@ -1058,6 +1149,7 @@ impl LedgerStorage {
     pub async fn delete_confirmed_block(&self, slot: Slot, dry_run: bool) -> Result<()> {
         let mut addresses: HashSet<&Pubkey> = HashSet::new();
         let mut expected_tx_infos: HashMap<String, UploadedTransaction> = HashMap::new();
+        let mut expected_tx_by_id_infos: HashMap<String, UploadedTransaction> = HashMap::new();
         let confirmed_block = self.get_confirmed_block(slot).await?;
         for (index, transaction_with_meta) in confirmed_block.transactions.iter().enumerate() {
             match transaction_with_meta {
@@ -1099,8 +1191,18 @@ impl LedgerStorage {
 
                     expected_tx_infos.insert(
                         signature.to_string(),
-                        UploadedTransaction { slot, index, err },
+                        UploadedTransaction {
+                            slot,
+                            index,
+                            err: err.clone(),
+                        },
                     );
+                    if transaction.is_v1() {
+                        expected_tx_by_id_infos.insert(
+                            transaction.transaction_identifier().to_string(),
+                            UploadedTransaction { slot, index, err },
+                        );
+                    }
                 }
             }
         }
@@ -1149,6 +1251,45 @@ impl LedgerStorage {
             vec![]
         };
 
+        let tx_by_id_deletion_rows = if !expected_tx_by_id_infos.is_empty() {
+            let transaction_ids = expected_tx_by_id_infos.keys().cloned().collect::<Vec<_>>();
+            let fetched_tx_infos: HashMap<String, std::result::Result<UploadedTransaction, _>> =
+                self.connection
+                    .get_bincode_cells_with_retry::<TransactionInfo>("tx-by-id", &transaction_ids)
+                    .await?
+                    .into_iter()
+                    .map(|(transaction_id, tx_info_res)| {
+                        (transaction_id, tx_info_res.map(Into::into))
+                    })
+                    .collect::<HashMap<_, _>>();
+
+            let mut deletion_rows = Vec::with_capacity(expected_tx_by_id_infos.len());
+            for (transaction_id, expected_tx_info) in expected_tx_by_id_infos {
+                match fetched_tx_infos.get(&transaction_id) {
+                    Some(Ok(fetched_tx_info)) if fetched_tx_info == &expected_tx_info => {
+                        deletion_rows.push(transaction_id);
+                    }
+                    Some(Ok(fetched_tx_info)) => {
+                        warn!(
+                            "skipped tx-by-id row {} because the bigtable entry ({:?}) did not match to {:?}",
+                            transaction_id, fetched_tx_info, &expected_tx_info,
+                        );
+                    }
+                    Some(Err(err)) => {
+                        warn!(
+                            "skipped tx-by-id row {transaction_id} because the bigtable entry was corrupted: {err:?}"
+                        );
+                    }
+                    None => {
+                        warn!("skipped tx-by-id row {transaction_id} because it was not found");
+                    }
+                }
+            }
+            deletion_rows
+        } else {
+            vec![]
+        };
+
         let entries_exist = self
             .connection
             .client()
@@ -1169,6 +1310,12 @@ impl LedgerStorage {
                     .await?;
             }
 
+            if !tx_by_id_deletion_rows.is_empty() {
+                self.connection
+                    .delete_rows_with_retry("tx-by-id", &tx_by_id_deletion_rows)
+                    .await?;
+            }
+
             if entries_exist {
                 self.connection
                     .delete_rows_with_retry("entries", &[slot_to_entries_key(slot)])
@@ -1181,11 +1328,12 @@ impl LedgerStorage {
         }
 
         info!(
-            "{}deleted ledger data for slot {}: {} transaction rows, {} address slot rows, {} \
-             entry row",
+            "{}deleted ledger data for slot {}: {} transaction rows, {} tx-by-id rows, {} \
+             address slot rows, {} entry row",
             if dry_run { "[dry run] " } else { "" },
             slot,
             tx_deletion_rows.len(),
+            tx_by_id_deletion_rows.len(),
             address_slot_rows.len(),
             if entries_exist { "with" } else { "WITHOUT" }
         );

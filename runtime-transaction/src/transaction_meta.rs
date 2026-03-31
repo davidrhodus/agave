@@ -21,6 +21,7 @@ use {
 pub trait StaticMeta {
     fn message_hash(&self) -> &Hash;
     fn is_simple_vote_transaction(&self) -> bool;
+    fn is_v1_transaction(&self) -> bool;
     fn signature_details(&self) -> &TransactionSignatureDetails;
     fn compute_budget_instruction_details(&self) -> &ComputeBudgetInstructionDetails;
     fn instruction_data_len(&self) -> u16;
@@ -38,6 +39,7 @@ pub trait DynamicMeta: StaticMeta {}
 pub struct TransactionMeta {
     pub(crate) message_hash: Hash,
     pub(crate) is_simple_vote_transaction: bool,
+    pub(crate) is_v1_transaction: bool,
     pub(crate) signature_details: TransactionSignatureDetails,
     pub(crate) compute_budget_instruction_details: ComputeBudgetInstructionDetails,
     pub(crate) instruction_data_len: u16,

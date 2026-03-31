@@ -132,6 +132,7 @@ struct SentNotificationStats {
     num_logs: AtomicUsize,
     num_program: AtomicUsize,
     num_signature: AtomicUsize,
+    num_transaction: AtomicUsize,
     num_slot: AtomicUsize,
     num_slots_updates: AtomicUsize,
     num_root: AtomicUsize,
@@ -164,6 +165,11 @@ impl SentNotificationStats {
                 (
                     "num_signature",
                     self.num_signature.swap(0, Ordering::Relaxed) as i64,
+                    i64
+                ),
+                (
+                    "num_transaction",
+                    self.num_transaction.swap(0, Ordering::Relaxed) as i64,
                     i64
                 ),
                 (
@@ -224,6 +230,9 @@ fn increment_sent_notification_stats(
         }
         SubscriptionParams::Signature(_) => {
             stats.num_signature.fetch_add(1, Ordering::Relaxed);
+        }
+        SubscriptionParams::Transaction(_) => {
+            stats.num_transaction.fetch_add(1, Ordering::Relaxed);
         }
         SubscriptionParams::Slot => {
             stats.num_slot.fetch_add(1, Ordering::Relaxed);

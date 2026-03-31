@@ -21,6 +21,13 @@ message ConfirmedTransaction {
 message Transaction {
     repeated bytes signatures = 1;
     Message message = 2;
+    repeated NativeAuthEntry native_auth_entries = 3;
+}
+
+message NativeAuthEntry {
+    uint32 scheme = 1;
+    bytes verifier_key = 2;
+    bytes proof = 3;
 }
 
 message Message {

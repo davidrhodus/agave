@@ -1,4 +1,5 @@
 use {
+    agave_native_auth::TransactionIdentifier,
     bincode::{deserialize, serialize},
     crossbeam_channel::{unbounded, Receiver, Sender},
     futures::{future, prelude::stream::StreamExt},
@@ -30,6 +31,7 @@ use {
         sanitized::{MessageHash, SanitizedTransaction},
         versioned::VersionedTransaction,
     },
+    solana_transaction_error::TransactionError,
     std::{
         io,
         net::{Ipv4Addr, SocketAddr},
@@ -142,32 +144,66 @@ impl BanksServer {
         self.bank_forks.read().unwrap()[self.slot(commitment)].clone()
     }
 
-    async fn poll_signature_status(
+    async fn poll_transaction_status(
         self,
-        signature: &Signature,
+        identifier: &TransactionIdentifier,
         blockhash: &Hash,
         last_valid_block_height: u64,
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
-        let mut status = self
-            .bank(commitment)
-            .get_signature_status_with_blockhash(signature, blockhash);
+        let mut status = match identifier {
+            TransactionIdentifier::Signature(signature) => self
+                .bank(commitment)
+                .get_signature_status_with_blockhash(signature, blockhash),
+            TransactionIdentifier::Txid(txid) => self
+                .bank(commitment)
+                .get_transaction_status_with_blockhash(txid, blockhash),
+        };
         while status.is_none() {
             sleep(self.poll_signature_status_sleep_duration).await;
             let bank = self.bank(commitment);
             if bank.block_height() > last_valid_block_height {
                 break;
             }
-            status = bank.get_signature_status_with_blockhash(signature, blockhash);
+            status = match identifier {
+                TransactionIdentifier::Signature(signature) => {
+                    bank.get_signature_status_with_blockhash(signature, blockhash)
+                }
+                TransactionIdentifier::Txid(txid) => {
+                    bank.get_transaction_status_with_blockhash(txid, blockhash)
+                }
+            };
         }
         status
     }
+
+    fn get_transaction_status_by_identifier(
+        &self,
+        bank: &Bank,
+        identifier: &TransactionIdentifier,
+    ) -> Option<(Slot, transaction::Result<()>)> {
+        match identifier {
+            TransactionIdentifier::Signature(signature) => bank.get_signature_status_slot(signature),
+            TransactionIdentifier::Txid(txid) => bank.get_transaction_status_slot(txid),
+        }
+    }
+}
+
+fn native_auth_v1_enabled(bank: &Bank) -> bool {
+    bank.feature_set
+        .is_active(&agave_feature_set::enable_transaction_v1_native_auth::id())
 }
 
 fn simulate_transaction(
     bank: &Bank,
     transaction: VersionedTransaction,
 ) -> BanksTransactionResultWithSimulation {
+    if transaction.is_v1() && !native_auth_v1_enabled(bank) {
+        return BanksTransactionResultWithSimulation {
+            result: Some(Err(TransactionError::UnsupportedVersion)),
+            simulation_details: None,
+        };
+    }
     let sanitized_transaction = match RuntimeTransaction::try_create(
         transaction,
         MessageHash::Compute,
@@ -216,7 +252,12 @@ fn simulate_transaction(
 #[tarpc::server]
 impl Banks for BanksServer {
     async fn send_transaction_with_context(self, _: Context, transaction: VersionedTransaction) {
-        let message_hash = transaction.message.hash();
+        let root_bank = self.bank_forks.read().unwrap().root_bank();
+        if transaction.is_v1() && !native_auth_v1_enabled(&root_bank) {
+            return;
+        }
+        let message_hash = transaction.transaction_id();
+        let identifier = transaction.transaction_identifier();
         let blockhash = transaction.message.recent_blockhash();
         let last_valid_block_height = self
             .bank_forks
@@ -225,10 +266,9 @@ impl Banks for BanksServer {
             .root_bank()
             .get_blockhash_last_valid_block_height(blockhash)
             .unwrap();
-        let signature = transaction.signatures.first().cloned().unwrap_or_default();
         let info = TransactionInfo::new(
             message_hash,
-            signature,
+            identifier,
             *blockhash,
             serialize(&transaction).unwrap(),
             last_valid_block_height,
@@ -244,13 +284,25 @@ impl Banks for BanksServer {
         _: Context,
         signature: Signature,
     ) -> Option<TransactionStatus> {
+        self.get_transaction_status_with_context_by_id(
+            Context::current(),
+            TransactionIdentifier::Signature(signature),
+        )
+        .await
+    }
+
+    async fn get_transaction_status_with_context_by_id(
+        self,
+        _: Context,
+        transaction_id: TransactionIdentifier,
+    ) -> Option<TransactionStatus> {
         let bank = self.bank(CommitmentLevel::Processed);
-        let (slot, status) = bank.get_signature_status_slot(&signature)?;
+        let (slot, status) = self.get_transaction_status_by_identifier(&bank, &transaction_id)?;
         let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
 
         let optimistically_confirmed_bank = self.bank(CommitmentLevel::Confirmed);
         let optimistically_confirmed =
-            optimistically_confirmed_bank.get_signature_status_slot(&signature);
+            self.get_transaction_status_by_identifier(&optimistically_confirmed_bank, &transaction_id);
 
         let confirmations = if r_block_commitment_cache.root() >= slot
             && r_block_commitment_cache.highest_super_majority_root() >= slot
@@ -317,6 +369,9 @@ impl Banks for BanksServer {
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
         let bank = self.bank(commitment);
+        if transaction.is_v1() && !native_auth_v1_enabled(&bank) {
+            return Some(Err(TransactionError::UnsupportedVersion));
+        }
         let sanitized_transaction = match SanitizedTransaction::try_create(
             transaction.clone(),
             MessageHash::Compute,
@@ -332,16 +387,16 @@ impl Banks for BanksServer {
             return Some(Err(err));
         }
 
-        let message_hash = sanitized_transaction.message_hash();
+        let message_hash = sanitized_transaction.transaction_id();
         let blockhash = transaction.message.recent_blockhash();
         let last_valid_block_height = self
             .bank(commitment)
             .get_blockhash_last_valid_block_height(blockhash)
             .unwrap();
-        let signature = sanitized_transaction.signature();
+        let identifier = transaction.transaction_identifier();
         let info = TransactionInfo::new(
             *message_hash,
-            *signature,
+            identifier,
             *blockhash,
             serialize(&transaction).unwrap(),
             last_valid_block_height,
@@ -350,7 +405,7 @@ impl Banks for BanksServer {
             None,
         );
         self.transaction_sender.send(info).unwrap();
-        self.poll_signature_status(signature, blockhash, last_valid_block_height, commitment)
+        self.poll_transaction_status(&identifier, blockhash, last_valid_block_height, commitment)
             .await
     }
 
@@ -360,6 +415,12 @@ impl Banks for BanksServer {
         transaction: VersionedTransaction,
     ) -> BanksTransactionResultWithMetadata {
         let bank = self.bank_forks.read().unwrap().working_bank();
+        if transaction.is_v1() && !native_auth_v1_enabled(&bank) {
+            return BanksTransactionResultWithMetadata {
+                result: Err(TransactionError::UnsupportedVersion),
+                metadata: None,
+            };
+        }
         match bank.process_transaction_with_metadata(transaction) {
             Err(error) => BanksTransactionResultWithMetadata {
                 result: Err(error),

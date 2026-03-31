@@ -273,6 +273,10 @@ impl solana_runtime_transaction::transaction_meta::StaticMeta for WritableKeysTr
         unimplemented!("WritableKeysTransaction::is_simple_vote_transaction")
     }
 
+    fn is_v1_transaction(&self) -> bool {
+        false
+    }
+
     fn signature_details(&self) -> &solana_message::TransactionSignatureDetails {
         const DUMMY: solana_message::TransactionSignatureDetails =
             solana_message::TransactionSignatureDetails::new(0, 0, 0, 0);

@@ -169,7 +169,7 @@ impl RpcSender for MockSender {
                 block_height: 34,
                 transaction_count: Some(123),
             })?,
-            "getSignatureStatuses" => {
+            "getSignatureStatuses" | "getTransactionStatusesById" => {
                 let status: TransactionResult<()> = if self.url == "account_in_use" {
                     Err(TransactionError::AccountInUse)
                 } else if self.url == "instruction_error" {
@@ -203,10 +203,15 @@ impl RpcSender for MockSender {
                     value: statuses,
                 })?
             }
-            "getTransaction" => serde_json::to_value(EncodedConfirmedTransactionWithStatusMeta {
+            "getTransaction" | "getTransactionById" => serde_json::to_value(EncodedConfirmedTransactionWithStatusMeta {
                 slot: 2,
                 transaction: EncodedTransactionWithStatusMeta {
                     version: Some(TransactionVersion::LEGACY),
+                    transaction_id: Some(
+                        "3AsdoALgZFuq2oUVWrDYhg2pNeaLJKPLf8hU2mQ6U8qJxeJ6hsrPVpMn9ma39DtfYCrDQSvngWRP8NnTpEhezJpE"
+                            .to_string(),
+                    ),
+                    native_auth_entries: None,
                     transaction: EncodedTransaction::Json(
                         UiTransaction {
                             signatures: vec!["3AsdoALgZFuq2oUVWrDYhg2pNeaLJKPLf8hU2mQ6U8qJxeJ6hsrPVpMn9ma39DtfYCrDQSvngWRP8NnTpEhezJpE".to_string()],
@@ -414,6 +419,8 @@ impl RpcSender for MockSender {
                     ),
                     meta: None,
                     version: Some(TransactionVersion::LEGACY),
+                    transaction_id: None,
+                    native_auth_entries: None,
                 }],
                 rewards: Rewards::new(),
                 num_partitions: None,
@@ -425,6 +432,7 @@ impl RpcSender for MockSender {
             "getSignaturesForAddress" => {
                 serde_json::to_value(vec![RpcConfirmedTransactionStatusWithSignature {
                     signature: crate::mock_sender_for_cli::SIGNATURE.to_string(),
+                    transaction_id: crate::mock_sender_for_cli::SIGNATURE.to_string(),
                     slot: 123,
                     err: None,
                     memo: None,

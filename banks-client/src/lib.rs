@@ -19,6 +19,7 @@ pub use {
     solana_banks_interface::{BanksClient as TarpcClient, TransactionStatus},
 };
 use {
+    agave_native_auth::TransactionIdentifier,
     borsh::BorshDeserialize,
     futures::future::join_all,
     solana_account::{from_account, Account},
@@ -90,6 +91,17 @@ impl BanksClient {
     ) -> Result<Option<TransactionStatus>, BanksClientError> {
         self.inner
             .get_transaction_status_with_context(ctx, signature)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn get_transaction_status_with_context_by_id(
+        &self,
+        ctx: Context,
+        transaction_id: TransactionIdentifier,
+    ) -> Result<Option<TransactionStatus>, BanksClientError> {
+        self.inner
+            .get_transaction_status_with_context_by_id(ctx, transaction_id)
             .await
             .map_err(Into::into)
     }

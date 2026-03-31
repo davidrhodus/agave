@@ -1,4 +1,5 @@
 use {
+    agave_native_auth::NativeAuthEntry,
     crate::{
         address_table_lookup_frame::AddressTableLookupIterator,
         instructions_frame::InstructionsIterator, result::Result, sanitize::sanitize,
@@ -67,6 +68,12 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     #[inline]
     pub fn version(&self) -> TransactionVersion {
         self.frame.version()
+    }
+
+    /// Return native auth entries for v1 transactions.
+    #[inline]
+    pub fn native_auth_entries(&self) -> &[NativeAuthEntry] {
+        self.frame.native_auth_entries()
     }
 
     /// Return the number of required signatures in the transaction.
@@ -157,6 +164,12 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
         unsafe { self.frame.address_table_lookup_iter(data) }
     }
 
+    /// Return the stable v1 transaction id, if present.
+    #[inline]
+    pub fn transaction_id(&self) -> Option<&Hash> {
+        self.frame.transaction_id()
+    }
+
     /// Return the full serialized transaction data.
     #[inline]
     pub fn data(&self) -> &[u8] {
@@ -167,7 +180,7 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     /// This does not include the signatures.
     #[inline]
     pub fn message_data(&self) -> &[u8] {
-        &self.data()[usize::from(self.frame.message_offset())..]
+        &self.data()[self.frame.message_offset()..]
     }
 
     #[inline]
@@ -239,6 +252,7 @@ impl<const SANITIZED: bool, D: TransactionData> Debug for TransactionView<SANITI
         f.debug_struct("TransactionView")
             .field("frame", &self.frame)
             .field("signatures", &self.signatures())
+            .field("native_auth_entries", &self.native_auth_entries())
             .field("static_account_keys", &self.static_account_keys())
             .field("recent_blockhash", &self.recent_blockhash())
             .field("instructions", &self.instructions_iter())
@@ -305,6 +319,7 @@ mod tests {
                 ],
                 Some(&payer),
             )),
+            native_auth_entries: vec![],
         }
     }
 

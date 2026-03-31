@@ -25,10 +25,11 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
     ) -> Result<Self> {
         let message_hash = match message_hash {
             MessageHash::Precomputed(hash) => hash,
-            MessageHash::Compute => sanitized_versioned_tx.get_message().message.hash(),
+            MessageHash::Compute => sanitized_versioned_tx.transaction_id(),
         };
         let is_simple_vote_tx = is_simple_vote_tx
             .unwrap_or_else(|| is_simple_vote_transaction(&sanitized_versioned_tx));
+        let is_v1_transaction = sanitized_versioned_tx.is_v1();
 
         let InstructionMeta {
             precompile_signature_details,
@@ -63,6 +64,7 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
             meta: TransactionMeta {
                 message_hash,
                 is_simple_vote_transaction: is_simple_vote_tx,
+                is_v1_transaction,
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,

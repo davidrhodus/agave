@@ -106,6 +106,11 @@ pub fn init() {
     }
 }
 
+#[inline]
+fn is_v1_native_auth_packet(packet: PacketRef) -> bool {
+    packet.data(..2).is_some_and(|bytes| bytes == [0, 1])
+}
+
 /// Returns true if the signatrue on the packet verifies.
 /// Caller must do packet.set_discard(true) if this returns false.
 #[must_use]
@@ -113,6 +118,12 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
     // If this packet was already marked as discard, drop it
     if packet.meta().discard() {
         return false;
+    }
+
+    // Native-auth transactions bypass Ed25519 TPU sigverify and are verified
+    // later against their scheme-specific proofs in runtime.
+    if is_v1_native_auth_packet(packet.as_ref()) {
+        return true;
     }
 
     let packet_offsets = get_packet_offsets(packet, 0, reject_non_vote);
@@ -625,6 +636,15 @@ pub fn ed25519_verify(
     let Some(valid_percentage) = maybe_valid_percentage else {
         return;
     };
+    if batches
+        .iter()
+        .flatten()
+        .filter(|packet| !packet.meta().discard())
+        .any(is_v1_native_auth_packet)
+    {
+        ed25519_verify_cpu(batches, reject_non_vote, valid_packet_count);
+        return;
+    }
     if valid_percentage < 90 || valid_packet_count < 64 {
         ed25519_verify_cpu(batches, reject_non_vote, valid_packet_count);
         return;

@@ -528,7 +528,10 @@ fn consume_scan_should_process_packet(
     }
 
     // Resolve the transaction (votes do not have LUTs).
-    debug_assert!(!matches!(view.version(), TransactionVersion::V0));
+    debug_assert!(!matches!(
+        view.version(),
+        TransactionVersion::V0 | TransactionVersion::V1
+    ));
     let Ok(view) = RuntimeTransactionView::try_from(view, None, bank.get_reserved_account_keys())
     else {
         return None;

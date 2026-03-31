@@ -1,7 +1,7 @@
 use {
     crate::{
         bytes::{
-            advance_offset_for_array, check_remaining, optimized_read_compressed_u16, read_byte,
+            advance_offset_for_array, check_remaining, read_byte, read_compressed_u16,
             unchecked_read_byte, unchecked_read_slice_data,
         },
         result::Result,
@@ -16,7 +16,7 @@ pub(crate) struct InstructionsFrame {
     /// The number of instructions in the transaction.
     pub(crate) num_instructions: u16,
     /// The offset to the first instruction in the transaction.
-    pub(crate) offset: u16,
+    pub(crate) offset: usize,
     pub(crate) frames: Vec<InstructionFrame>,
 }
 
@@ -40,7 +40,7 @@ impl InstructionsFrame {
         // Read the number of instructions at the current offset.
         // Each instruction needs at least 3 bytes, so do a sanity check here to
         // ensure we have enough bytes to read the number of instructions.
-        let num_instructions = optimized_read_compressed_u16(bytes, offset)?;
+        let num_instructions = read_compressed_u16(bytes, offset)?;
         check_remaining(
             bytes,
             *offset,
@@ -49,7 +49,7 @@ impl InstructionsFrame {
 
         // We know the offset does not exceed packet length, and our packet
         // length is less than u16::MAX, so we can safely cast to u16.
-        let instructions_offset = *offset as u16;
+        let instructions_offset = *offset;
 
         // Pre-allocate buffer for frames.
         let mut frames = Vec::with_capacity(usize::from(num_instructions));
@@ -69,14 +69,14 @@ impl InstructionsFrame {
             // Read the number of account indexes, and then update the offset
             // to skip over the account indexes.
             let num_accounts_offset = *offset;
-            let num_accounts = optimized_read_compressed_u16(bytes, offset)?;
+            let num_accounts = read_compressed_u16(bytes, offset)?;
             let num_accounts_len = offset.wrapping_sub(num_accounts_offset) as u8;
             advance_offset_for_array::<u8>(bytes, offset, num_accounts)?;
 
             // Read the length of the data, and then update the offset to skip
             // over the data.
             let data_len_offset = *offset;
-            let data_len = optimized_read_compressed_u16(bytes, offset)?;
+            let data_len = read_compressed_u16(bytes, offset)?;
             let data_len_len = offset.wrapping_sub(data_len_offset) as u8;
             advance_offset_for_array::<u8>(bytes, offset, data_len)?;
 

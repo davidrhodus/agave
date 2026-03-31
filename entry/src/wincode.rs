@@ -2,11 +2,17 @@
 //!
 //! These definitions should eventually be upstreamed to the solana sdk repository.
 use {
+    agave_native_auth::{
+        compatibility_signatures, compute_transaction_id,
+        NativeAuthDescriptor, NativeAuthEntry as TransactionNativeAuthEntry, NativeAuthScheme,
+    },
     solana_address::Address,
     solana_hash::Hash,
     solana_message::{self, legacy, v0, MESSAGE_VERSION_PREFIX},
     solana_signature::Signature,
-    solana_transaction::versioned,
+    solana_transaction::versioned::{
+        self, TRANSACTION_V1_ESCAPE_PREFIX, TRANSACTION_V1_NUMBER,
+    },
     std::mem::{self, MaybeUninit},
     wincode::{
         containers::{self, Elem, Pod},
@@ -61,11 +67,90 @@ struct V0Message {
     address_table_lookups: containers::Vec<Elem<MessageAddressTableLookup>, ShortU16Len>,
 }
 
+pub(crate) struct VersionedTransaction;
+
 #[derive(SchemaWrite, SchemaRead)]
-#[wincode(from = "versioned::VersionedTransaction")]
-pub(crate) struct VersionedTransaction {
-    signatures: containers::Vec<Pod<Signature>, ShortU16Len>,
-    message: VersionedMsg,
+#[wincode(from = "TransactionNativeAuthEntry")]
+struct NativeAuthEntry {
+    #[wincode(with = "Pod<_>")]
+    scheme: NativeAuthScheme,
+    verifier_key: containers::Vec<Pod<u8>, ShortU16Len>,
+    proof: containers::Vec<Pod<u8>, ShortU16Len>,
+}
+
+impl SchemaWrite for VersionedTransaction {
+    type Src = versioned::VersionedTransaction;
+
+    #[inline(always)]
+    fn size_of(src: &Self::Src) -> WriteResult<usize> {
+        let message_size = VersionedMsg::size_of(&src.message)?;
+        if src.is_v1() {
+            Ok(2
+                + containers::Vec::<Elem<NativeAuthEntry>, ShortU16Len>::size_of(
+                    &src.native_auth_entries,
+                )?
+                + message_size)
+        } else {
+            Ok(containers::Vec::<Pod<Signature>, ShortU16Len>::size_of(&src.signatures)?
+                + message_size)
+        }
+    }
+
+    #[inline(always)]
+    fn write(writer: &mut Writer, src: &Self::Src) -> WriteResult<()> {
+        if src.is_v1() {
+            u8::write(writer, &TRANSACTION_V1_ESCAPE_PREFIX)?;
+            u8::write(writer, &TRANSACTION_V1_NUMBER)?;
+            containers::Vec::<Elem<NativeAuthEntry>, ShortU16Len>::write(
+                writer,
+                &src.native_auth_entries,
+            )?;
+        } else {
+            containers::Vec::<Pod<Signature>, ShortU16Len>::write(writer, &src.signatures)?;
+        }
+        VersionedMsg::write(writer, &src.message)
+    }
+}
+
+impl SchemaRead<'_> for VersionedTransaction {
+    type Dst = versioned::VersionedTransaction;
+
+    fn read(reader: &mut Reader, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
+        let first = *reader.peek()?;
+        if first == TRANSACTION_V1_ESCAPE_PREFIX {
+            reader.consume_unchecked(1);
+            let version = u8::get(reader)?;
+            if version != TRANSACTION_V1_NUMBER {
+                return Err(invalid_tag_encoding(version as usize));
+            }
+
+            let native_auth_entries =
+                containers::Vec::<Elem<NativeAuthEntry>, ShortU16Len>::get(reader)?;
+            let message = VersionedMsg::get(reader)?;
+            let txid = compute_transaction_id(
+                &message.serialize(),
+                native_auth_entries.iter().map(|entry| NativeAuthDescriptor {
+                    scheme: entry.scheme,
+                    verifier_key: &entry.verifier_key,
+                }),
+            );
+            dst.write(versioned::VersionedTransaction {
+                signatures: compatibility_signatures(&txid, native_auth_entries.len()),
+                message,
+                native_auth_entries,
+            });
+        } else {
+            let signatures = containers::Vec::<Pod<Signature>, ShortU16Len>::get(reader)?;
+            let message = VersionedMsg::get(reader)?;
+            dst.write(versioned::VersionedTransaction {
+                signatures,
+                message,
+                native_auth_entries: Vec::new(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 struct VersionedMsg;
@@ -235,6 +320,7 @@ impl SchemaRead<'_> for VersionedMsg {
 #[cfg(test)]
 mod tests {
     use {
+        agave_native_auth::{NativeAuthEntry, NativeAuthScheme},
         crate::entry::{Entry, MAX_DATA_SHREDS_SIZE},
         proptest::prelude::*,
         solana_address::{Address, ADDRESS_BYTES},
@@ -348,6 +434,7 @@ mod tests {
             .prop_map(|(signatures, message)| VersionedTransaction {
                 signatures,
                 message,
+                native_auth_entries: vec![],
             })
     }
 
@@ -457,6 +544,7 @@ mod tests {
         let transaction = VersionedTransaction {
             signatures: vec![],
             message: VersionedMessage::Legacy(message),
+            native_auth_entries: vec![],
         };
         let entry = Entry {
             num_hashes: 0,
@@ -497,6 +585,7 @@ mod tests {
         let transaction = VersionedTransaction {
             signatures: vec![],
             message: VersionedMessage::Legacy(message),
+            native_auth_entries: vec![],
         };
         let entry = Entry {
             num_hashes: 0,
@@ -518,5 +607,40 @@ mod tests {
                 needed: _,
             }
         ));
+    }
+
+    #[test]
+    fn v1_transaction_serialization_equivalence() {
+        let transaction = VersionedTransaction::try_new_v1(
+            VersionedMessage::V0(v0::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 0,
+                },
+                account_keys: vec![Address::new_from_array([1u8; ADDRESS_BYTES])],
+                recent_blockhash: Hash::new_from_array([2u8; HASH_BYTES]),
+                instructions: vec![],
+                address_table_lookups: vec![],
+            }),
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: vec![3u8; 32],
+                proof: vec![4u8; 64],
+            }],
+        )
+        .unwrap();
+        let entry = Entry {
+            num_hashes: 0,
+            hash: Hash::new_from_array([5u8; HASH_BYTES]),
+            transactions: vec![transaction],
+        };
+
+        let wincode_bytes = wincode::serialize(&entry).unwrap();
+        let bincode_bytes = bincode::serialize(&entry).unwrap();
+        assert_eq!(wincode_bytes, bincode_bytes);
+
+        let decoded: Entry = wincode::deserialize(&wincode_bytes).unwrap();
+        assert_eq!(decoded, entry);
     }
 }

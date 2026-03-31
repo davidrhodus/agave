@@ -16,6 +16,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 agave-unstable-api = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 crossbeam-channel = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }

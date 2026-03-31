@@ -20,6 +20,7 @@ name = "solana_storage_proto"
 agave-unstable-api = []
 
 [dependencies]
+agave-native-auth = { workspace = true }
 bincode = { workspace = true }
 bs58 = { workspace = true }
 prost = { workspace = true }

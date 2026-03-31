@@ -19,6 +19,7 @@ use {
         },
         rpc_sender::*,
     },
+    agave_native_auth::TransactionIdentifier,
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::serialize,
     futures::join,
@@ -1642,6 +1643,29 @@ impl RpcClient {
         .await
     }
 
+    pub async fn get_transaction_statuses_by_id(
+        &self,
+        transaction_ids: &[TransactionIdentifier],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        let transaction_ids: Vec<_> = transaction_ids.iter().map(ToString::to_string).collect();
+        self.send(RpcRequest::GetTransactionStatusesById, json!([transaction_ids]))
+            .await
+    }
+
+    pub async fn get_transaction_statuses_by_id_with_history(
+        &self,
+        transaction_ids: &[TransactionIdentifier],
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        let transaction_ids: Vec<_> = transaction_ids.iter().map(ToString::to_string).collect();
+        self.send(
+            RpcRequest::GetTransactionStatusesById,
+            json!([transaction_ids, {
+                "searchTransactionHistory": true
+            }]),
+        )
+        .await
+    }
+
     /// Check if a transaction has been processed with the given [commitment level][cl].
     ///
     /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
@@ -2901,6 +2925,30 @@ impl RpcClient {
         self.send(
             RpcRequest::GetTransaction,
             json!([signature.to_string(), config]),
+        )
+        .await
+    }
+
+    pub async fn get_transaction_by_id(
+        &self,
+        transaction_id: &TransactionIdentifier,
+        encoding: UiTransactionEncoding,
+    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
+        self.send(
+            RpcRequest::GetTransactionById,
+            json!([transaction_id.to_string(), encoding]),
+        )
+        .await
+    }
+
+    pub async fn get_transaction_by_id_with_config(
+        &self,
+        transaction_id: &TransactionIdentifier,
+        config: RpcTransactionConfig,
+    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
+        self.send(
+            RpcRequest::GetTransactionById,
+            json!([transaction_id.to_string(), config]),
         )
         .await
     }

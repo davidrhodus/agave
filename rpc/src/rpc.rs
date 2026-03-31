@@ -7,6 +7,7 @@ use {
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
     },
+    agave_native_auth::TransactionIdentifier,
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
@@ -77,6 +78,7 @@ use {
     solana_signature::Signature,
     solana_signer::Signer,
     solana_storage_bigtable::Error as StorageError,
+    solana_streamer::quic::MAX_QUIC_TRANSACTION_SIZE,
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
         versioned::VersionedTransaction,
@@ -104,7 +106,7 @@ use {
         state::{Account as TokenAccount, Mint},
     },
     std::{
-        any::type_name,
+        any::{type_name, TypeId},
         cmp::{max, min, Reverse},
         collections::{BinaryHeap, HashMap, HashSet},
         convert::TryFrom,
@@ -1659,7 +1661,92 @@ impl JsonRpcRequestProcessor {
             } else if search_transaction_history {
                 if let Some(status) = self
                     .blockstore
-                    .get_rooted_transaction_status(signature)
+                    .get_rooted_transaction(signature)
+                    .map_err(|_| Error::internal_error())?
+                    .filter(|confirmed_transaction| {
+                        !confirmed_transaction.get_transaction().is_v1()
+                            && confirmed_transaction.slot
+                                <= self
+                                    .block_commitment_cache
+                                    .read()
+                                    .unwrap()
+                                    .highest_super_majority_root()
+                    })
+                    .map(|confirmed_transaction| {
+                        let slot = confirmed_transaction.slot;
+                        let meta = confirmed_transaction
+                            .tx_with_meta
+                            .get_status_meta()
+                            .expect("rooted transaction must have metadata");
+                        let err = meta.status.clone().err();
+                        TransactionStatus {
+                            slot,
+                            status: meta.status,
+                            confirmations: None,
+                            err,
+                            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                        }
+                    })
+                {
+                    Some(status)
+                } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
+                    bigtable_ledger_storage
+                        .get_confirmed_transaction(&signature)
+                        .await
+                        .unwrap_or(None)
+                        .filter(|confirmed_transaction| {
+                            !confirmed_transaction.get_transaction().is_v1()
+                        })
+                        .map(|confirmed_transaction| {
+                            let slot = confirmed_transaction.slot;
+                            let meta = confirmed_transaction
+                                .tx_with_meta
+                                .get_status_meta()
+                                .expect("stored transaction must have metadata");
+                            let err = meta.status.clone().err();
+                            TransactionStatus {
+                                slot,
+                                status: meta.status,
+                                confirmations: None,
+                                err,
+                                confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                            }
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            statuses.push(status);
+        }
+        Ok(new_response(&bank, statuses))
+    }
+
+    pub async fn get_transaction_statuses_by_id(
+        &self,
+        identifiers: Vec<TransactionIdentifier>,
+        config: Option<RpcSignatureStatusConfig>,
+    ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>> {
+        let search_transaction_history = config
+            .map(|x| x.search_transaction_history)
+            .unwrap_or(false);
+        if search_transaction_history {
+            self.check_if_transaction_history_enabled()?;
+        }
+
+        let bank = self.bank(Some(CommitmentConfig::processed()));
+        let mut statuses: Vec<Option<TransactionStatus>> = vec![];
+
+        for identifier in identifiers {
+            let status = if let Some(status) =
+                self.get_transaction_status_by_identifier(&identifier, &bank)
+            {
+                Some(status)
+            } else if search_transaction_history {
+                if let Some(status) = self
+                    .blockstore
+                    .get_rooted_transaction_status_by_identifier(&identifier)
                     .map_err(|_| Error::internal_error())?
                     .filter(|(slot, _status_meta)| {
                         slot <= &self
@@ -1682,7 +1769,7 @@ impl JsonRpcRequestProcessor {
                     Some(status)
                 } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
                     bigtable_ledger_storage
-                        .get_signature_status(&signature)
+                        .get_transaction_status_by_identifier(&identifier)
                         .await
                         .map(Some)
                         .unwrap_or(None)
@@ -1702,11 +1789,28 @@ impl JsonRpcRequestProcessor {
         signature: Signature,
         bank: &Bank,
     ) -> Option<TransactionStatus> {
-        let (slot, status) = bank.get_signature_status_slot(&signature)?;
+        self.get_transaction_status_by_identifier(&TransactionIdentifier::Signature(signature), bank)
+    }
+
+    fn get_transaction_status_by_identifier(
+        &self,
+        identifier: &TransactionIdentifier,
+        bank: &Bank,
+    ) -> Option<TransactionStatus> {
+        let (slot, status) = match identifier {
+            TransactionIdentifier::Signature(signature) => bank.get_signature_status_slot(signature)?,
+            TransactionIdentifier::Txid(txid) => bank.get_transaction_status_slot(txid)?,
+        };
 
         let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
-        let optimistically_confirmed =
-            optimistically_confirmed_bank.get_signature_status_slot(&signature);
+        let optimistically_confirmed = match identifier {
+            TransactionIdentifier::Signature(signature) => {
+                optimistically_confirmed_bank.get_signature_status_slot(signature)
+            }
+            TransactionIdentifier::Txid(txid) => {
+                optimistically_confirmed_bank.get_transaction_status_slot(txid)
+            }
+        };
 
         let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
         let confirmations = if r_block_commitment_cache.root() >= slot
@@ -1734,9 +1838,9 @@ impl JsonRpcRequestProcessor {
         })
     }
 
-    pub async fn get_transaction(
+    pub async fn get_transaction_by_identifier(
         &self,
-        signature: Signature,
+        identifier: TransactionIdentifier,
         config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
     ) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>> {
         self.check_if_transaction_history_enabled()?;
@@ -1758,9 +1862,10 @@ impl JsonRpcRequestProcessor {
                 move || {
                     if commitment.is_confirmed() {
                         let highest_confirmed_slot = confirmed_bank.slot();
-                        blockstore.get_complete_transaction(signature, highest_confirmed_slot)
+                        blockstore
+                            .get_complete_transaction_by_identifier(identifier, highest_confirmed_slot)
                     } else {
-                        blockstore.get_rooted_transaction(signature)
+                        blockstore.get_rooted_transaction_by_identifier(identifier)
                     }
                 }
             })
@@ -1775,7 +1880,7 @@ impl JsonRpcRequestProcessor {
         match confirmed_transaction.unwrap_or(None) {
             Some(mut confirmed_transaction) => {
                 if commitment.is_confirmed()
-                    && confirmed_bank // should be redundant
+                    && confirmed_bank
                         .status_cache_ancestors()
                         .contains(&confirmed_transaction.slot)
                 {
@@ -1801,7 +1906,7 @@ impl JsonRpcRequestProcessor {
             None => {
                 if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
                     return bigtable_ledger_storage
-                        .get_confirmed_transaction(&signature)
+                        .get_confirmed_transaction_by_identifier(&identifier)
                         .await
                         .unwrap_or(None)
                         .map(encode_transaction)
@@ -1811,6 +1916,24 @@ impl JsonRpcRequestProcessor {
         }
 
         Ok(None)
+    }
+
+    pub async fn get_transaction(
+        &self,
+        signature: Signature,
+        config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
+    ) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>> {
+        let signature_string = signature.to_string();
+        let transaction = self
+            .get_transaction_by_identifier(TransactionIdentifier::Signature(signature), config)
+            .await?;
+        Ok(transaction.filter(|confirmed_transaction| {
+            confirmed_transaction
+                .transaction
+                .transaction_id
+                .as_deref()
+                .map_or(true, |transaction_id| transaction_id == signature_string)
+        }))
     }
 
     pub async fn get_signatures_for_address(
@@ -2446,6 +2569,12 @@ fn verify_signature(input: &str) -> Result<Signature> {
         .map_err(|e| Error::invalid_params(format!("Invalid param: {e:?}")))
 }
 
+fn verify_transaction_identifier(input: &str) -> Result<TransactionIdentifier> {
+    input
+        .parse()
+        .map_err(|e| Error::invalid_params(format!("Invalid param: {e}")))
+}
+
 fn verify_token_account_filter(
     token_account_filter: RpcTokenAccountsFilter,
 ) -> Result<TokenAccountsFilter> {
@@ -2675,16 +2804,17 @@ fn get_token_program_id_and_mint(
 fn _send_transaction(
     meta: JsonRpcRequestProcessor,
     message_hash: Hash,
-    signature: Signature,
+    identifier: impl Into<TransactionIdentifier>,
     blockhash: Hash,
     wire_transaction: Vec<u8>,
     last_valid_block_height: u64,
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
+    let identifier = identifier.into();
     let transaction_info = TransactionInfo::new(
         message_hash,
-        signature,
+        identifier,
         blockhash,
         wire_transaction,
         last_valid_block_height,
@@ -2696,7 +2826,7 @@ fn _send_transaction(
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
 
-    Ok(signature.to_string())
+    Ok(identifier.to_string())
 }
 
 // Minimal RPC interface that known validators are expected to provide
@@ -3476,6 +3606,14 @@ pub mod rpc_full {
             config: Option<RpcSignatureStatusConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>>;
 
+        #[rpc(meta, name = "getTransactionStatusesById")]
+        fn get_transaction_statuses_by_id(
+            &self,
+            meta: Self::Metadata,
+            transaction_ids: Vec<String>,
+            config: Option<RpcSignatureStatusConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>>;
+
         #[rpc(meta, name = "getMaxRetransmitSlot")]
         fn get_max_retransmit_slot(&self, meta: Self::Metadata) -> Result<Slot>;
 
@@ -3548,6 +3686,14 @@ pub mod rpc_full {
             &self,
             meta: Self::Metadata,
             signature_str: String,
+            config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
+        ) -> BoxFuture<Result<Option<EncodedConfirmedTransactionWithStatusMeta>>>;
+
+        #[rpc(meta, name = "getTransactionById")]
+        fn get_transaction_by_id(
+            &self,
+            meta: Self::Metadata,
+            transaction_id: String,
             config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
         ) -> BoxFuture<Result<Option<EncodedConfirmedTransactionWithStatusMeta>>>;
 
@@ -3722,6 +3868,31 @@ pub mod rpc_full {
             Box::pin(async move { meta.get_signature_statuses(signatures, config).await })
         }
 
+        fn get_transaction_statuses_by_id(
+            &self,
+            meta: Self::Metadata,
+            transaction_ids: Vec<String>,
+            config: Option<RpcSignatureStatusConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+            debug!(
+                "get_transaction_statuses_by_id rpc request received: {:?}",
+                transaction_ids.len()
+            );
+            if transaction_ids.len() > MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS {
+                return Box::pin(future::err(Error::invalid_params(format!(
+                    "Too many inputs provided; max {MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS}"
+                ))));
+            }
+            let mut identifiers = Vec::with_capacity(transaction_ids.len());
+            for transaction_id in transaction_ids {
+                match verify_transaction_identifier(&transaction_id) {
+                    Ok(identifier) => identifiers.push(identifier),
+                    Err(err) => return Box::pin(future::err(err)),
+                }
+            }
+            Box::pin(async move { meta.get_transaction_statuses_by_id(identifiers, config).await })
+        }
+
         fn get_max_retransmit_slot(&self, meta: Self::Metadata) -> Result<Slot> {
             debug!("get_max_retransmit_slot rpc request received");
             Ok(meta.get_max_retransmit_slot())
@@ -3816,6 +3987,11 @@ pub mod rpc_full {
             })?;
             let (wire_transaction, unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+            if unsanitized_tx.is_v1() && binary_encoding == TransactionBinaryEncoding::Base58 {
+                return Err(Error::invalid_params(
+                    "transaction version 1 requires base64 encoding",
+                ));
+            }
 
             let preflight_commitment = if skip_preflight {
                 Some(CommitmentConfig::processed())
@@ -3826,6 +4002,13 @@ pub mod rpc_full {
                 commitment: preflight_commitment,
                 min_context_slot,
             })?;
+            if unsanitized_tx.is_v1()
+                && !preflight_bank
+                    .feature_set
+                    .is_active(&agave_feature_set::enable_transaction_v1_native_auth::id())
+            {
+                return Err(RpcCustomError::UnsupportedTransactionVersion(1).into());
+            }
 
             let transaction = sanitize_transaction(
                 unsanitized_tx,
@@ -3838,6 +4021,11 @@ pub mod rpc_full {
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
+            let identifier = if transaction.is_v1() {
+                TransactionIdentifier::Txid(*transaction.transaction_id())
+            } else {
+                TransactionIdentifier::Signature(signature)
+            };
 
             let mut last_valid_block_height = preflight_bank
                 .get_blockhash_last_valid_block_height(&blockhash)
@@ -3932,7 +4120,7 @@ pub mod rpc_full {
             _send_transaction(
                 meta,
                 message_hash,
-                signature,
+                identifier,
                 blockhash,
                 wire_transaction,
                 last_valid_block_height,
@@ -3965,11 +4153,23 @@ pub mod rpc_full {
             })?;
             let (_, mut unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+            if unsanitized_tx.is_v1() && binary_encoding == TransactionBinaryEncoding::Base58 {
+                return Err(Error::invalid_params(
+                    "transaction version 1 requires base64 encoding",
+                ));
+            }
 
             let bank = &*meta.get_bank_with_config(RpcContextConfig {
                 commitment,
                 min_context_slot,
             })?;
+            if unsanitized_tx.is_v1()
+                && !bank
+                    .feature_set
+                    .is_active(&agave_feature_set::enable_transaction_v1_native_auth::id())
+            {
+                return Err(RpcCustomError::UnsupportedTransactionVersion(1).into());
+            }
             let mut blockhash: Option<RpcBlockhash> = None;
             if replace_recent_blockhash {
                 if sig_verify {
@@ -4169,6 +4369,23 @@ pub mod rpc_full {
             Box::pin(async move { meta.get_transaction(signature.unwrap(), config).await })
         }
 
+        fn get_transaction_by_id(
+            &self,
+            meta: Self::Metadata,
+            transaction_id: String,
+            config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
+        ) -> BoxFuture<Result<Option<EncodedConfirmedTransactionWithStatusMeta>>> {
+            debug!("get_transaction_by_id rpc request received: {transaction_id:?}");
+            let identifier = verify_transaction_identifier(&transaction_id);
+            if let Err(err) = identifier {
+                return Box::pin(future::err(err));
+            }
+            Box::pin(async move {
+                meta.get_transaction_by_identifier(identifier.unwrap(), config)
+                    .await
+            })
+        }
+
         fn get_signatures_for_address(
             &self,
             meta: Self::Metadata,
@@ -4340,14 +4557,29 @@ fn rpc_perf_sample_from_perf_sample(slot: u64, sample: PerfSample) -> RpcPerfSam
 }
 
 const MAX_BASE58_SIZE: usize = 1683; // Golden, bump if PACKET_DATA_SIZE changes
+#[cfg(test)]
 const MAX_BASE64_SIZE: usize = 1644; // Golden, bump if PACKET_DATA_SIZE changes
+
+const fn max_base64_len(raw_len: usize) -> usize {
+    ((raw_len + 2) / 3) * 4
+}
+
+fn max_serialized_transaction_size<T: 'static>() -> usize {
+    if TypeId::of::<T>() == TypeId::of::<VersionedTransaction>() {
+        MAX_QUIC_TRANSACTION_SIZE
+    } else {
+        PACKET_DATA_SIZE
+    }
+}
+
 fn decode_and_deserialize<T>(
     encoded: String,
     encoding: TransactionBinaryEncoding,
 ) -> Result<(Vec<u8>, T)>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + 'static,
 {
+    let max_serialized_size = max_serialized_transaction_size::<T>();
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
             inc_new_counter_info!("rpc-base58_encoded_tx", 1);
@@ -4366,13 +4598,14 @@ where
         }
         TransactionBinaryEncoding::Base64 => {
             inc_new_counter_info!("rpc-base64_encoded_tx", 1);
-            if encoded.len() > MAX_BASE64_SIZE {
+            let max_base64_size = max_base64_len(max_serialized_size);
+            if encoded.len() > max_base64_size {
                 return Err(Error::invalid_params(format!(
                     "base64 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
                     type_name::<T>(),
                     encoded.len(),
-                    MAX_BASE64_SIZE,
-                    PACKET_DATA_SIZE,
+                    max_base64_size,
+                    max_serialized_size,
                 )));
             }
             BASE64_STANDARD
@@ -4380,16 +4613,16 @@ where
                 .map_err(|e| Error::invalid_params(format!("invalid base64 encoding: {e:?}")))?
         }
     };
-    if wire_output.len() > PACKET_DATA_SIZE {
+    if wire_output.len() > max_serialized_size {
         return Err(Error::invalid_params(format!(
             "decoded {} too large: {} bytes (max: {} bytes)",
             type_name::<T>(),
             wire_output.len(),
-            PACKET_DATA_SIZE
+            max_serialized_size
         )));
     }
     bincode::options()
-        .with_limit(PACKET_DATA_SIZE as u64)
+        .with_limit(max_serialized_size as u64)
         .with_fixint_encoding()
         .allow_trailing_bytes()
         .deserialize_from(&wire_output[..])
@@ -4522,6 +4755,10 @@ pub mod tests {
             rpc_service::service_runtime,
             rpc_subscriptions::RpcSubscriptions,
         },
+        agave_native_auth::{
+            compute_transaction_id, verify_entries, NativeAuthDescriptor, NativeAuthEntry,
+            NativeAuthScheme,
+        },
         agave_reserved_account_keys::ReservedAccountKeys,
         bincode::deserialize,
         jsonrpc_core::{futures, ErrorCode, MetaIoHandler, Output, Response, Value},
@@ -4546,7 +4783,7 @@ pub mod tests {
             get_tmp_ledger_path,
         },
         solana_message::{
-            v0::{self, MessageAddressTableLookup},
+            v0::{self, LoadedAddresses, MessageAddressTableLookup},
             Message, MessageHeader, SimpleAddressLoader, VersionedMessage,
         },
         solana_nonce::{self as nonce, state::DurableNonce},
@@ -4582,11 +4819,11 @@ pub mod tests {
         solana_system_transaction as system_transaction,
         solana_sysvar::slot_hashes::SlotHashes,
         solana_time_utils::slot_duration_from_slots_per_year,
-        solana_transaction::{versioned::TransactionVersion, Transaction},
+        solana_transaction::{versioned::{TransactionVersion, VersionedTransaction}, Transaction},
         solana_transaction_error::TransactionError,
         solana_transaction_status::{
             EncodedConfirmedBlock, EncodedTransaction, EncodedTransactionWithStatusMeta,
-            TransactionDetails,
+            TransactionDetails, TransactionStatusMeta,
         },
         solana_vote_interface::state::VoteStateV4,
         solana_vote_program::{
@@ -4944,6 +5181,93 @@ pub mod tests {
             let entries = vec![entry1, entry2];
             self.overwrite_working_bank_entries(entries);
             signatures
+        }
+
+        fn create_test_v1_transaction_and_populate_blockstore(&self) -> (Signature, Hash) {
+            let bank = self.working_bank();
+            let message = VersionedMessage::V0(v0::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 0,
+                },
+                recent_blockhash: bank.confirmed_last_blockhash(),
+                account_keys: vec![self.mint_keypair.pubkey()],
+                address_table_lookups: vec![],
+                instructions: vec![],
+            });
+            let verifier_key = self.mint_keypair.pubkey().to_bytes().to_vec();
+            let txid = compute_transaction_id(
+                &message.serialize(),
+                [NativeAuthDescriptor {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key: &verifier_key,
+                }],
+            );
+            let mut transaction = VersionedTransaction::try_new_v1(
+                message,
+                vec![NativeAuthEntry {
+                    scheme: NativeAuthScheme::Ed25519,
+                    verifier_key,
+                    proof: vec![],
+                }],
+            )
+            .unwrap();
+            let proof = self.mint_keypair.sign_message(txid.as_ref());
+            assert!(proof.verify(
+                self.mint_keypair.pubkey().as_ref(),
+                txid.as_ref(),
+            ));
+            transaction.native_auth_entries[0].proof = proof.as_ref().to_vec();
+            verify_entries(
+                &transaction.message.serialize(),
+                &[self.mint_keypair.pubkey()],
+                transaction.native_auth_entries.iter().map(NativeAuthEntry::as_ref),
+            )
+            .unwrap();
+            assert_eq!(transaction.verify_with_results(), vec![true]);
+            let compatibility_signature = transaction.signatures[0];
+            let entry =
+                next_versioned_entry(&bank.confirmed_last_blockhash(), 1, vec![transaction]);
+            let shreds = solana_ledger::blockstore::entries_to_test_shreds(
+                &[entry],
+                bank.slot(),
+                bank.parent_slot(),
+                true,
+                0,
+            );
+            self.blockstore.insert_shreds(shreds, None, false).unwrap();
+            self.blockstore
+                .set_roots(std::iter::once(&bank.slot()))
+                .unwrap();
+            self.blockstore
+                .write_transaction_status_with_id(
+                    bank.slot(),
+                    compatibility_signature,
+                    txid,
+                    std::iter::empty(),
+                    TransactionStatusMeta {
+                        status: Ok(()),
+                        fee: TEST_SIGNATURE_FEE,
+                        pre_balances: vec![],
+                        post_balances: vec![],
+                        inner_instructions: None,
+                        log_messages: None,
+                        pre_token_balances: None,
+                        post_token_balances: None,
+                        rewards: None,
+                        loaded_addresses: LoadedAddresses {
+                            writable: vec![],
+                            readonly: vec![],
+                        },
+                        return_data: None,
+                        compute_units_consumed: None,
+                        cost_units: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            (compatibility_signature, txid)
         }
 
         fn store_address_lookup_table(&self) -> Pubkey {
@@ -6792,6 +7116,80 @@ pub mod tests {
     }
 
     #[test]
+    fn test_rpc_get_transaction_statuses_by_id_v1() {
+        let rpc = RpcHandler::start();
+        let (compatibility_signature, txid) = rpc.create_test_v1_transaction_and_populate_blockstore();
+
+        let req = create_test_request(
+            "getTransactionStatusesById",
+            Some(json!([[txid.to_string()], {"searchTransactionHistory": true}])),
+        );
+        let result: RpcResponse<Vec<Option<TransactionStatus>>> =
+            parse_success_result(rpc.handle_request_sync(req));
+        let status = result.value[0].clone().expect("v1 status should be found by txid");
+        assert_eq!(status.status, Ok(()));
+        assert_eq!(
+            status.confirmation_status,
+            Some(TransactionConfirmationStatus::Finalized)
+        );
+
+        let req = create_test_request(
+            "getSignatureStatuses",
+            Some(json!([[compatibility_signature.to_string()], {"searchTransactionHistory": true}])),
+        );
+        let result: RpcResponse<Vec<Option<TransactionStatus>>> =
+            parse_success_result(rpc.handle_request_sync(req));
+        assert!(result.value[0].is_none());
+    }
+
+    #[test]
+    fn test_rpc_get_transaction_by_id_v1() {
+        let rpc = RpcHandler::start();
+        let (compatibility_signature, txid) = rpc.create_test_v1_transaction_and_populate_blockstore();
+
+        let req = create_test_request(
+            "getTransactionById",
+            Some(json!([
+                txid.to_string(),
+                {
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 1,
+                }
+            ])),
+        );
+        let result: Option<EncodedConfirmedTransactionWithStatusMeta> =
+            parse_success_result(rpc.handle_request_sync(req));
+        let transaction = result.expect("v1 transaction should be found by txid");
+        assert_eq!(transaction.transaction.transaction_id, Some(txid.to_string()));
+        assert_eq!(
+            transaction.transaction.version,
+            Some(TransactionVersion::Number(1))
+        );
+        assert_eq!(
+            transaction
+                .transaction
+                .native_auth_entries
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let req = create_test_request(
+            "getTransaction",
+            Some(json!([
+                compatibility_signature.to_string(),
+                {
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 1,
+                }
+            ])),
+        );
+        let result: Option<EncodedConfirmedTransactionWithStatusMeta> =
+            parse_success_result(rpc.handle_request_sync(req));
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_rpc_fail_request_airdrop() {
         let RpcHandler { meta, io, .. } = RpcHandler::start();
 
@@ -7356,6 +7754,7 @@ pub mod tests {
             transaction,
             meta,
             version,
+            ..
         } in confirmed_block.transactions.into_iter()
         {
             assert_eq!(
@@ -7401,6 +7800,7 @@ pub mod tests {
             transaction,
             meta,
             version,
+            ..
         } in confirmed_block.transactions.into_iter()
         {
             assert_eq!(
@@ -9223,6 +9623,7 @@ pub mod tests {
                 account_keys: vec![Pubkey::new_unique()],
                 ..v0::Message::default()
             }),
+            native_auth_entries: vec![],
         };
 
         assert_eq!(

@@ -40,7 +40,7 @@ solana-sdk-ids = { workspace = true }
 solana-signature = { workspace = true }
 solana-stake-interface = { workspace = true }
 solana-system-interface = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["blake3", "serde"] }
 solana-transaction-error = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 solana-vote-interface = { workspace = true }

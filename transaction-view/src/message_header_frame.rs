@@ -11,7 +11,7 @@ use {
 #[derive(Debug)]
 pub(crate) struct MessageHeaderFrame {
     /// The offset to the first byte of the message in the transaction packet.
-    pub(crate) offset: u16,
+    pub(crate) offset: usize,
     /// The version of the transaction.
     pub(crate) version: TransactionVersion,
     /// The number of signatures required for this message to be considered
@@ -31,7 +31,7 @@ impl MessageHeaderFrame {
         // Get the message offset.
         // We know the offset does not exceed packet length, and our packet
         // length is less than u16::MAX, so we can safely cast to u16.
-        let message_offset = *offset as u16;
+        let message_offset = *offset;
 
         // Read the message prefix byte if present. This byte is present in V0
         // transactions but not in legacy transactions.

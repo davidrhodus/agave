@@ -5,6 +5,7 @@
 //! provided to the [`CompletedDataSetsService`].
 
 use {
+    agave_native_auth::TransactionIdentifier,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
     solana_entry::entry::Entry,
     solana_ledger::blockstore::{Blockstore, CompletedDataSetInfo},
@@ -69,9 +70,12 @@ impl CompletedDataSetsService {
             let CompletedDataSetInfo { slot, indices } = completed_data_set_info;
             match blockstore.get_entries_in_data_block(slot, indices, /*slot_meta:*/ None) {
                 Ok(entries) => {
-                    let transactions = Self::get_transaction_signatures(entries);
-                    if !transactions.is_empty() {
-                        rpc_subscriptions.notify_signatures_received((slot, transactions));
+                    let (signatures, transaction_ids) = Self::get_received_transactions(entries);
+                    if !signatures.is_empty() {
+                        rpc_subscriptions.notify_signatures_received((slot, signatures));
+                    }
+                    if !transaction_ids.is_empty() {
+                        rpc_subscriptions.notify_transactions_received((slot, transaction_ids));
                     }
                 }
                 Err(e) => warn!("completed-data-set-service deserialize error: {e:?}"),
@@ -90,15 +94,27 @@ impl CompletedDataSetsService {
         Ok(())
     }
 
-    fn get_transaction_signatures(entries: Vec<Entry>) -> Vec<Signature> {
-        entries
-            .into_iter()
-            .flat_map(|e| {
-                e.transactions
-                    .into_iter()
-                    .filter_map(|mut t| t.signatures.drain(..).next())
-            })
-            .collect::<Vec<Signature>>()
+    fn get_received_transactions(
+        entries: Vec<Entry>,
+    ) -> (Vec<Signature>, Vec<TransactionIdentifier>) {
+        let mut signatures = Vec::new();
+        let mut transaction_ids = Vec::new();
+
+        for entry in entries {
+            for transaction in entry.transactions {
+                let transaction_id = transaction.transaction_identifier();
+                if let Some(signature) = transaction_id.signature().copied() {
+                    if !transaction.signatures.is_empty() {
+                        signatures.push(signature);
+                        transaction_ids.push(transaction_id);
+                    }
+                } else {
+                    transaction_ids.push(transaction_id);
+                }
+            }
+        }
+
+        (signatures, transaction_ids)
     }
 
     pub fn join(self) -> thread::Result<()> {
@@ -109,16 +125,58 @@ impl CompletedDataSetsService {
 #[cfg(test)]
 pub mod test {
     use {
-        super::*, solana_hash::Hash, solana_keypair::Keypair, solana_signer::Signer,
-        solana_transaction::Transaction,
+        super::*,
+        agave_native_auth::{
+            compute_transaction_id, NativeAuthDescriptor, NativeAuthEntry, NativeAuthScheme,
+        },
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::{v0, MessageHeader, VersionedMessage},
+        solana_signer::Signer,
+        solana_transaction::{versioned::VersionedTransaction, Transaction},
     };
+
+    fn create_test_v1_transaction(payer: &Keypair, recent_blockhash: Hash) -> VersionedTransaction {
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            recent_blockhash,
+            account_keys: vec![payer.pubkey()],
+            address_table_lookups: vec![],
+            instructions: vec![],
+        });
+        let verifier_key = payer.pubkey().to_bytes().to_vec();
+        let txid = compute_transaction_id(
+            &message.serialize(),
+            [NativeAuthDescriptor {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key: &verifier_key,
+            }],
+        );
+        let mut tx = VersionedTransaction::try_new_v1(
+            message,
+            vec![NativeAuthEntry {
+                scheme: NativeAuthScheme::Ed25519,
+                verifier_key,
+                proof: vec![],
+            }],
+        )
+        .unwrap();
+        tx.native_auth_entries[0].proof = payer.sign_message(txid.as_ref()).as_ref().to_vec();
+        assert_eq!(tx.verify_with_results(), vec![true]);
+        tx
+    }
 
     #[test]
     fn test_zero_signatures() {
         let tx = Transaction::new_with_payer(&[], None);
         let entries = vec![Entry::new(&Hash::default(), 1, vec![tx])];
-        let signatures = CompletedDataSetsService::get_transaction_signatures(entries);
+        let (signatures, transaction_ids) = CompletedDataSetsService::get_received_transactions(entries);
         assert!(signatures.is_empty());
+        assert!(transaction_ids.is_empty());
     }
 
     #[test]
@@ -127,14 +185,36 @@ pub mod test {
         let tx =
             Transaction::new_signed_with_payer(&[], Some(&kp.pubkey()), &[&kp], Hash::default());
         let entries = vec![Entry::new(&Hash::default(), 1, vec![tx.clone()])];
-        let signatures = CompletedDataSetsService::get_transaction_signatures(entries);
+        let (signatures, transaction_ids) =
+            CompletedDataSetsService::get_received_transactions(entries);
         assert_eq!(signatures.len(), 1);
+        assert_eq!(transaction_ids.len(), 1);
 
         let entries = vec![
             Entry::new(&Hash::default(), 1, vec![tx.clone(), tx.clone()]),
             Entry::new(&Hash::default(), 1, vec![tx]),
         ];
-        let signatures = CompletedDataSetsService::get_transaction_signatures(entries);
+        let (signatures, transaction_ids) =
+            CompletedDataSetsService::get_received_transactions(entries);
         assert_eq!(signatures.len(), 3);
+        assert_eq!(transaction_ids.len(), 3);
+    }
+
+    #[test]
+    fn test_v1_transactions_emit_txids_not_compatibility_signatures() {
+        let kp = Keypair::new();
+        let tx = create_test_v1_transaction(&kp, Hash::default());
+        let txid = tx.transaction_identifier();
+        let entries = vec![Entry {
+            num_hashes: 1,
+            hash: Hash::default(),
+            transactions: vec![tx],
+        }];
+
+        let (signatures, transaction_ids) =
+            CompletedDataSetsService::get_received_transactions(entries);
+        assert!(signatures.is_empty());
+        assert_eq!(transaction_ids, vec![txid]);
+        assert_eq!(txid.signature(), None);
     }
 }

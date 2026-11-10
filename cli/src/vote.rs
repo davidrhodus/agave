@@ -2131,27 +2131,40 @@ async fn get_vat_withdrawal_reserve(
         ));
     }
     let slot = response.context.slot;
-    let mut features = agave_feature_set::FeatureSet::default();
+    // Activation slots of the gates that are active at `slot`.
+    let mut activation_slots = Vec::with_capacity(feature_ids.len());
     for (id, account) in feature_ids.into_iter().zip(response.value) {
         if let Some(account) = account {
             let invalid_feature =
                 || CliError::RpcRequestError(format!("Invalid VAT feature account {id}"));
             let account: Account = account.to_account().ok_or_else(invalid_feature)?;
+            // Anyone can fund a feature address before its feature account is
+            // created. Like the runtime, treat such an account as an inactive
+            // feature instead of failing the withdrawal.
+            if account.owner != solana_feature_gate_interface::id() {
+                continue;
+            }
             let feature = from_account(&account).ok_or_else(invalid_feature)?;
             if let Some(activation_slot) = feature
                 .activated_at
                 .filter(|activation_slot| *activation_slot <= slot)
             {
-                features.activate(&id, activation_slot);
+                activation_slots.push((id, activation_slot));
             }
         }
     }
-    if !features.is_active(&alpenglow::id()) {
+    let activated_slot = |id: &Pubkey| {
+        activation_slots
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, activation_slot)| *activation_slot)
+    };
+    if activated_slot(&alpenglow::id()).is_none() {
         return Ok(0);
     }
     let epoch_schedule = rpc_client.get_epoch_schedule().await?;
     let effective = |id: &Pubkey| {
-        features.activated_slot(id).is_some_and(|activation_slot| {
+        activated_slot(id).is_some_and(|activation_slot| {
             epoch_schedule.get_first_slot_in_epoch(
                 epoch_schedule.get_epoch(activation_slot).saturating_add(1),
             ) <= slot
@@ -2665,6 +2678,73 @@ mod tests {
                 Err(CliError::RpcRequestError(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn test_vat_reserve_ignores_non_feature_accounts() {
+        use {
+            base64::{Engine, prelude::BASE64_STANDARD},
+            serde_json::json,
+            solana_account::ReadableAccount,
+            solana_epoch_schedule::EpochSchedule,
+            solana_feature_gate_interface::{Feature, create_account},
+            solana_rpc_client_api::request::RpcRequest,
+        };
+
+        let alpenglow_account = create_account(
+            &Feature {
+                activated_at: Some(0),
+            },
+            1,
+        );
+        // A plain transfer to a feature address creates a system-owned account
+        // without data. The runtime does not treat it as a feature account.
+        let funded = json!({
+            "lamports": 1_000_000,
+            "data": ["", "base64"],
+            "owner": solana_sdk_ids::system_program::id().to_string(),
+            "executable": false,
+            "rentEpoch": 0,
+        });
+        let rpc_client = RpcClient::new_mock_with_mocks(
+            "succeeds".to_string(),
+            [
+                (
+                    RpcRequest::GetMultipleAccounts,
+                    json!({
+                        "context": { "slot": 64 },
+                        "value": [
+                            {
+                                "lamports": alpenglow_account.lamports(),
+                                "data": [
+                                    BASE64_STANDARD.encode(alpenglow_account.data()),
+                                    "base64",
+                                ],
+                                "owner": alpenglow_account.owner().to_string(),
+                                "executable": false,
+                                "rentEpoch": 0,
+                            },
+                            funded.clone(),
+                            funded.clone(),
+                            funded.clone(),
+                            funded.clone(),
+                            funded,
+                        ],
+                    }),
+                ),
+                (
+                    RpcRequest::GetEpochSchedule,
+                    json!(EpochSchedule::custom(32, 32, false)),
+                ),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            get_vat_withdrawal_reserve(&rpc_client, CommitmentConfig::confirmed())
+                .await
+                .unwrap(),
+            1_600_000_000
+        );
     }
 
     fn make_tmp_file() -> (String, NamedTempFile) {

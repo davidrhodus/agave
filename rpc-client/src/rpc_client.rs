@@ -4402,11 +4402,16 @@ impl RpcClient {
     /// Returns the slot at which a feature was activated, if it has been activated.
     ///
     /// The method downloads the feature account and deserializes it into a `Feature` struct.
+    ///
+    /// Anyone can fund a feature address before its feature account is created. As in the
+    /// runtime, an account that is not owned by the feature program is not a feature account,
+    /// so the feature is reported as not activated.
     pub fn get_feature_activation_slot(&self, feature_id: &Pubkey) -> ClientResult<Option<Slot>> {
         self.get_account_with_commitment(feature_id, self.commitment())
             .and_then(|maybe_feature_account| {
                 maybe_feature_account
                     .value
+                    .filter(|account| account.owner == solana_feature_gate_interface::id())
                     .map(|feature_account| {
                         feature_account.state().map_err(|_| {
                             ClientError::from(ErrorKind::Custom(
@@ -5431,6 +5436,62 @@ mod tests {
                 ErrorKind::Custom(message) if message == "Invalid blockhash"
             ),
         }
+    }
+
+    #[test]
+    fn test_get_feature_activation_slot() {
+        let feature_program = solana_feature_gate_interface::id().to_string();
+        let system_program = Pubkey::default().to_string();
+        // `Feature` serializes as an `Option<u64>` activation slot.
+        let activated = [&[1u8][..], &5u64.to_le_bytes()].concat();
+        let pending = [0u8; 9];
+        for (owner, data, expected) in [
+            (&feature_program, &activated[..], Some(Some(5))),
+            (&feature_program, &pending[..], Some(None)),
+            // A feature-owned account that does not hold a `Feature` is an error.
+            (&feature_program, &[][..], None),
+            // A plain transfer to the feature address does not create a feature account.
+            (&system_program, &[][..], Some(None)),
+            (&system_program, &activated[..], Some(None)),
+        ] {
+            let mocks = Mocks::from([(
+                RpcRequest::GetAccountInfo,
+                json!(Response {
+                    context: RpcResponseContext {
+                        slot: 1,
+                        api_version: None
+                    },
+                    value: json!({
+                        "lamports": 1_000_000,
+                        "data": [BASE64_STANDARD.encode(data), "base64"],
+                        "owner": owner,
+                        "executable": false,
+                        "rentEpoch": 0,
+                    }),
+                }),
+            )]);
+            let rpc_client = RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks);
+            let result = rpc_client.get_feature_activation_slot(&Pubkey::new_unique());
+            assert_eq!(result.ok(), expected, "owner {owner}, data {data:?}");
+        }
+
+        let mocks = Mocks::from([(
+            RpcRequest::GetAccountInfo,
+            json!(Response {
+                context: RpcResponseContext {
+                    slot: 1,
+                    api_version: None
+                },
+                value: Value::Null,
+            }),
+        )]);
+        let rpc_client = RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks);
+        assert_eq!(
+            rpc_client
+                .get_feature_activation_slot(&Pubkey::new_unique())
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

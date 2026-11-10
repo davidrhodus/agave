@@ -349,26 +349,30 @@ fn is_feature_active_at_slot(
 
 fn vat_to_burn_per_epoch(rpc_client: &RpcClient, slot: u64) -> client_error::Result<u64> {
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    // Slot-time gates and the VAT fee reduction take effect at the first slot
+    // of the epoch after activation.
+    let is_effective = |feature_id: &Pubkey| -> client_error::Result<bool> {
+        Ok(rpc_client
+            .get_feature_activation_slot(feature_id)?
+            .is_some_and(|activation_slot| {
+                let activation_epoch = epoch_schedule.get_epoch(activation_slot);
+                epoch_schedule.get_first_slot_in_epoch(activation_epoch.saturating_add(1)) <= slot
+            }))
+    };
+    let divisor = if is_effective(&agave_feature_set::halve_vat_fee::id())? {
+        2
+    } else {
+        1
+    };
 
-    // Keep this table in sync with runtime/src/slot_params.rs. Slot-time
-    // feature gates take effect at the first slot of the epoch after activation.
+    // Keep this table in sync with runtime/src/slot_params.rs.
     for (feature_id, vat_to_burn_per_epoch) in slot_time_reduction_vat_burns() {
-        let Some(activation_slot) = rpc_client.get_feature_activation_slot(&feature_id)? else {
-            continue;
-        };
-        if activation_slot > slot {
-            continue;
-        }
-
-        let activation_epoch = epoch_schedule.get_epoch(activation_slot);
-        let effective_slot =
-            epoch_schedule.get_first_slot_in_epoch(activation_epoch.saturating_add(1));
-        if effective_slot <= slot {
-            return Ok(vat_to_burn_per_epoch);
+        if is_effective(&feature_id)? {
+            return Ok(vat_to_burn_per_epoch / divisor);
         }
     }
 
-    Ok(LEGACY_VAT_TO_BURN_PER_EPOCH)
+    Ok(LEGACY_VAT_TO_BURN_PER_EPOCH / divisor)
 }
 
 fn get_minimum_vat_vote_account_balance(

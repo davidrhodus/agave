@@ -226,6 +226,9 @@ pub(crate) struct SlotParamsArchive {
     /// ranges. The transitions are normalized so slot duration never increases
     /// as slots advance, even if slot-time features activate out of order.
     param_transitions: BTreeMap<Slot, SlotParams>,
+    /// Fee changes must not split the timing schedule: inflation decay rounds
+    /// at each timing transition, even if the slot duration did not change.
+    vat_fee_reduction_slot: Option<Slot>,
 }
 
 impl Default for SlotParamsArchive {
@@ -265,7 +268,14 @@ impl SlotParamsArchive {
             }
         }
 
-        Self { param_transitions }
+        let vat_fee_reduction_slot = feature_set
+            .activated_slot(&feature_set::halve_vat_fee::ID)
+            .map(|slot| Self::feature_effective_slot(epoch_schedule, slot));
+
+        Self {
+            param_transitions,
+            vat_fee_reduction_slot,
+        }
     }
 
     /// Returns the baseline params supplied at genesis or snapshot restore.
@@ -278,14 +288,22 @@ impl SlotParamsArchive {
 
     /// Returns the slot params effective at `slot`.
     pub(crate) fn params_at_slot(&self, slot: Slot) -> SlotParams {
-        self.param_transitions
+        let mut params = self
+            .param_transitions
             .range(..=slot)
             .next_back()
             .map(|(_, params)| *params)
-            .unwrap_or(LEGACY_SLOT_PARAMS)
+            .unwrap_or(LEGACY_SLOT_PARAMS);
+        if self
+            .vat_fee_reduction_slot
+            .is_some_and(|effective_slot| slot >= effective_slot)
+        {
+            params.vat_to_burn_per_epoch /= 2;
+        }
+        params
     }
 
-    /// Returns sorted slot-parameter transitions.
+    /// Returns sorted timing transitions, excluding the independent VAT gate.
     pub(crate) fn param_transitions(&self) -> impl Iterator<Item = (Slot, SlotParams)> + '_ {
         self.param_transitions
             .iter()
@@ -322,8 +340,8 @@ impl SlotParamsArchive {
     /// Returns the first slot where a slot-time feature may affect bank state.
     ///
     /// A gate that activates in epoch E is effective starting at the first slot
-    /// of epoch E + 1, giving shred filters a full epoch of advance notice
-    /// before enforcing lower shred limits.
+    /// of epoch E + 1. This boundary applies to slot-time reductions and the
+    /// VAT fee reduction.
     fn feature_effective_slot(epoch_schedule: &EpochSchedule, activation_slot: Slot) -> Slot {
         let activation_epoch = epoch_schedule.get_epoch(activation_slot);
         epoch_schedule.get_first_slot_in_epoch(activation_epoch.saturating_add(1))
@@ -352,6 +370,42 @@ impl SlotParamsArchive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_vat_fee_reduction_at_next_epoch() {
+        let schedule = EpochSchedule::custom(32, 32, false);
+        // Exercise no slot-time feature, and every slot-time regime, with the
+        // fee activation before, during, and after the slot-time activation.
+        for slot_feature in std::iter::once(None).chain(slot_time_feature_gates().map(Some)) {
+            for activation_slot in [0, 32, 47, 64] {
+                let mut features = FeatureSet::default();
+                if let Some((id, _)) = slot_feature {
+                    features.activate(&id, 32);
+                }
+                let before = SlotParamsArchive::new(&features, &schedule, LEGACY_SLOT_PARAMS);
+                features.activate(&feature_set::halve_vat_fee::ID, activation_slot);
+                let after = SlotParamsArchive::new(&features, &schedule, LEGACY_SLOT_PARAMS);
+                let effective_slot =
+                    schedule.get_first_slot_in_epoch(schedule.get_epoch(activation_slot) + 1);
+                for slot in [
+                    0,
+                    effective_slot - 1,
+                    effective_slot,
+                    effective_slot + 32,
+                    128,
+                ] {
+                    let mut expected = before.params_at_slot(slot);
+                    if slot >= effective_slot {
+                        expected.vat_to_burn_per_epoch /= 2;
+                    }
+                    assert_eq!(after.params_at_slot(slot), expected);
+                }
+                // Rebuilding the archive (as on snapshot restore) must not halve twice.
+                let rebuilt = SlotParamsArchive::new(&features, &schedule, after.baseline_params());
+                assert_eq!(rebuilt.params_at_slot(128), after.params_at_slot(128));
+            }
+        }
+    }
 
     #[test]
     fn test_cost_limits_scaling_matches_simd_0525() {
